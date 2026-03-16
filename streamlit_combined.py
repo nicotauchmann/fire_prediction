@@ -15,7 +15,8 @@ import requests
 import streamlit as st
 import xarray as xr
 from PIL import Image
-from folium import CircleMarker, Element, Marker
+from branca.element import Element, MacroElement, Template
+from folium import CircleMarker, Marker
 from streamlit_folium import st_folium
 
 
@@ -94,8 +95,60 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 def latest_era5_reference_date() -> datetime:
-    """Approximate latest available month for ERA5-Land monthly means."""
     return datetime.utcnow().replace(day=1) - timedelta(days=90)
+
+
+def add_map_legend(map_obj):
+    template = """
+    {% macro html(this, kwargs) %}
+    <div style="
+        position: absolute;
+        bottom: 20px;
+        right: 20px;
+        z-index: 9999;
+        background: rgba(255,255,255,0.92);
+        border: 1px solid #bdbdbd;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-size: 12px;
+        color: #333333;
+        box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+        line-height: 1.35;
+    ">
+      <div style="font-weight:700; margin-bottom:6px;">Legend</div>
+      <div><span style="color:#cc2222;">■</span> LSTM high risk</div>
+      <div><span style="color:#dd8800;">■</span> LSTM moderate risk</div>
+      <div><span style="color:#eecc00;">■</span> LSTM low risk</div>
+      <div><span style="color:#33aa33;">■</span> LSTM minimal risk</div>
+      <div style="margin:6px 0; border-top:1px solid #d0d0d0;"></div>
+      <div><span style="color:red;">●</span> CV tile ≥ 0.80</div>
+      <div><span style="color:blue;">●</span> CV tile &lt; 0.80</div>
+      <div><span style="color:gray;">●</span> CV tile error</div>
+    </div>
+    {% endmacro %}
+    """
+    macro = MacroElement()
+    macro._template = Template(template)
+    map_obj.get_root().add_child(macro)
+
+
+def add_map_resize_fix(map_obj):
+    map_name = map_obj.get_name()
+    resize_js = f"""
+    <script>
+    setTimeout(function() {{
+        try {{
+            {map_name}.invalidateSize(true);
+        }} catch (e) {{}}
+    }}, 300);
+    setTimeout(function() {{
+        try {{
+            {map_name}.invalidateSize(true);
+        }} catch (e) {{}}
+    }}, 900);
+    </script>
+    """
+    map_obj.get_root().html.add_child(Element(resize_js))
 
 
 # ============================================================
@@ -123,7 +176,6 @@ def build_mapbox_url(lon: float, lat: float, token: str) -> str:
 
 
 def cross5_from_center(lat: float, lon: float):
-    """Exactly 5 points: center + N/S/E/W at fixed spacing."""
     dlat = SPACING_KM / 110.574
     dlon = SPACING_KM / (111.320 * math.cos(math.radians(lat)))
     pts = [
@@ -234,10 +286,6 @@ def load_scaler_cached():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFrame:
-    """
-    Download ERA5-Land monthly means for the 12 months ending on end_date_str.
-    Returns a DataFrame of shape (12, 8) with 'date' + 7 model features.
-    """
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
     latest = latest_era5_reference_date()
     if end > latest:
@@ -261,7 +309,7 @@ def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFra
         round(lon - 0.5, 2),
         round(lat - 0.5, 2),
         round(lon + 0.5, 2),
-    ]  # N, W, S, E
+    ]
 
     client = get_cds_client()
     with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
@@ -444,6 +492,7 @@ for key, value in state_defaults.items():
 sel_lat, sel_lon = st.session_state["selected_center"]
 latest_end = latest_era5_reference_date().date()
 
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -475,19 +524,11 @@ with st.sidebar:
     run_lstm_btn = st.button("Run meteorological only", use_container_width=True)
     clear = st.button("Clear results", use_container_width=True)
 
-    st.divider()
-    st.header("Files expected")
-    st.code(
-        "saved_model/vgg16_model.keras\n"
-        "saved_model/lstm_model.keras\n"
-        "saved_model/scaler.pkl   # optional",
-        language=None,
-    )
-
 if clear:
     for k in ["cv_df", "cv_imgs", "lstm_prob", "era5_df"]:
         st.session_state[k] = state_defaults[k]
     rerun_app()
+
 
 # ============================================================
 # SINGLE MAP
@@ -499,12 +540,11 @@ main_map = folium.Map(
     zoom_start=DEFAULT_ZOOM_PICK,
     tiles=ESRI_TILE_URL,
     attr=ESRI_ATTR,
+    control_scale=True,
 )
 
-# Exact clicked point
 Marker(location=[sel_lat, sel_lon], popup="Selected point").add_to(main_map)
 
-# H3 polygon overlay for the meteorological model
 if st.session_state["h3_cell"]:
     poly_color = "#4a8a4a"
     if st.session_state["lstm_prob"] is not None:
@@ -527,7 +567,6 @@ if st.session_state["h3_cell"]:
         ),
     ).add_to(main_map)
 
-# CV 5-point overlay on the same single map
 if st.session_state["cv_df"] is not None:
     for _, row in st.session_state["cv_df"].iterrows():
         la = float(row["lat"])
@@ -551,22 +590,8 @@ if st.session_state["cv_df"] is not None:
             popup=popup,
         ).add_to(main_map)
 
-legend = """
-<div style="position:fixed;bottom:28px;right:28px;z-index:9999;
-            background:#ffffff;border:1px solid #cccccc;border-radius:10px;
-            padding:12px 16px;font-size:12px;color:#333333;">
-  <b>Legend</b><br>
-  <span style="color:#cc2222">■</span> LSTM high risk<br>
-  <span style="color:#dd8800">■</span> LSTM moderate risk<br>
-  <span style="color:#eecc00">■</span> LSTM low risk<br>
-  <span style="color:#33aa33">■</span> LSTM minimal risk<br>
-  <hr style="margin:6px 0;">
-  <span style="color:red">●</span> CV tile ≥ 0.80<br>
-  <span style="color:blue">●</span> CV tile &lt; 0.80<br>
-  <span style="color:gray">●</span> CV tile error
-</div>
-"""
-main_map.get_root().html.add_child(Element(legend))
+add_map_legend(main_map)
+add_map_resize_fix(main_map)
 
 picked = st_folium(main_map, width=950, height=540, key="main_map")
 
@@ -597,6 +622,7 @@ if picked and picked.get("last_clicked"):
 
 if st.session_state["h3_cell"] is None:
     st.info("Click on the map to choose a location before running a prediction.")
+
 
 # ============================================================
 # RUN MODELS
@@ -656,6 +682,7 @@ if want_lstm:
         rerun_app()
     except Exception as e:
         st.error(f"Meteorological pipeline failed: {e}")
+
 
 # ============================================================
 # RESULTS
