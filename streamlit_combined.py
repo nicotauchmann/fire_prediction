@@ -35,7 +35,7 @@ TILE_SIZE = 350
 RESCALE = 1.0 / 255.0
 SPACING_KM = 3.0
 CV_WILDFIRE_INDEX = 1
-LIKELY_THRESHOLD = 0.85
+LIKELY_THRESHOLD = 0.9
 CV_MODEL_PATH = Path("saved_model") / "vgg16_model.keras"
 
 # --- Meteorological / ERA5 + LSTM ---
