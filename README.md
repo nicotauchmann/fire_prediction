@@ -2,7 +2,7 @@
 
 This Streamlit app combines two wildfire prediction approaches for locations in Québec:
 
-- **Computer vision model (VGG16):** downloads 5 satellite tiles around a selected point and predicts wildfire likelihood from imagery.
+- **Computer vision model (VGG16):** downloads 5 satellite tiles around a selected point and predicts infrastructural wildfire likelihood from imagery.
 - **Meteorological model (LSTM):** snaps the selected point to an H3 cell, fetches ERA5-Land climate data, and predicts wildfire likelihood from environmental conditions.
 
 
