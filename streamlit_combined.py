@@ -69,7 +69,6 @@ ERA5_VARIABLES = [
 # --- UI defaults ---
 DEFAULT_CENTER = (52.0, -71.0)  # Québec
 DEFAULT_ZOOM_PICK = 5
-DEFAULT_ZOOM_RESULT = 6
 ESRI_TILE_URL = (
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/"
     "MapServer/tile/{z}/{y}/{x}"
@@ -217,7 +216,9 @@ def load_lstm_model_cached():
     import tensorflow as tf
 
     if not LSTM_MODEL_PATH.exists():
-        raise FileNotFoundError(f"LSTM model file not found: {LSTM_MODEL_PATH.resolve()}")
+        raise FileNotFoundError(
+            f"LSTM model file not found: {LSTM_MODEL_PATH.resolve()}"
+        )
     return tf.keras.models.load_model(LSTM_MODEL_PATH)
 
 
@@ -284,7 +285,9 @@ def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFra
         extract_dir = tempfile.mkdtemp()
         with zipfile.ZipFile(tmp_path, "r") as zf:
             zf.extractall(extract_dir)
-        candidates = list(Path(extract_dir).glob("*.nc")) + list(Path(extract_dir).glob("*.netcdf"))
+        candidates = list(Path(extract_dir).glob("*.nc")) + list(
+            Path(extract_dir).glob("*.netcdf")
+        )
         if not candidates:
             raise RuntimeError("ZIP from CDS contained no NetCDF file.")
         tmp_path = str(candidates[0])
@@ -315,7 +318,9 @@ def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFra
                 "volumetric_soil_water_layer_1": _val("swvl1"),
                 "surface_solar_radiation_downwards": _val("ssrd"),
                 "total_evaporation": _val("e"),
-                "wind_total": math.sqrt(u**2 + v**2) if not (np.isnan(u) or np.isnan(v)) else np.nan,
+                "wind_total": math.sqrt(u**2 + v**2)
+                if not (np.isnan(u) or np.isnan(v))
+                else np.nan,
                 "total_precipitation": _val("tp"),
                 "leaf_area_index_high_vegetation": _val("lai_hv"),
             }
@@ -377,9 +382,46 @@ st.caption(
 st.markdown(
     """
 <style>
-[data-testid="stAppViewContainer"] { background: #ffffff; }
-[data-testid="stSidebar"]          { background: #f7f7f7; border-right:1px solid #e0e0e0; }
-.result-card { border:1px solid #e0e0e0; border-radius:12px; padding:16px 18px; margin-bottom:12px; }
+[data-testid="stAppViewContainer"] {
+    background: #2f2f2f;
+    color: #f2f2f2;
+}
+[data-testid="stHeader"] {
+    background: #2f2f2f;
+}
+[data-testid="stSidebar"] {
+    background: #3a3a3a;
+    border-right: 1px solid #555555;
+}
+[data-testid="stSidebar"] * {
+    color: #f2f2f2 !important;
+}
+h1, h2, h3, h4, h5, h6, p, div, span, label {
+    color: #f2f2f2;
+}
+.result-card {
+    background: #444444;
+    border: 1px solid #666666;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+}
+.stButton > button {
+    background: #555555;
+    color: #f2f2f2;
+    border: 1px solid #777777;
+    border-radius: 8px;
+}
+.stButton > button:hover {
+    background: #666666;
+    border-color: #888888;
+}
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+    color: #f2f2f2 !important;
+}
+code {
+    color: #ffffff !important;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -448,19 +490,19 @@ if clear:
     rerun_app()
 
 # ============================================================
-# PICK MAP
+# SINGLE MAP
 # ============================================================
 st.subheader("1) Pick a location")
 
-pick_map = folium.Map(
+main_map = folium.Map(
     location=[sel_lat, sel_lon],
     zoom_start=DEFAULT_ZOOM_PICK,
     tiles=ESRI_TILE_URL,
     attr=ESRI_ATTR,
 )
 
-# Exact click marker
-Marker(location=[sel_lat, sel_lon], popup="Selected point").add_to(pick_map)
+# Exact clicked point
+Marker(location=[sel_lat, sel_lon], popup="Selected point").add_to(main_map)
 
 # H3 polygon overlay for the meteorological model
 if st.session_state["h3_cell"]:
@@ -483,22 +525,50 @@ if st.session_state["h3_cell"]:
                 else ""
             )
         ),
-    ).add_to(pick_map)
+    ).add_to(main_map)
 
-legend = f"""
+# CV 5-point overlay on the same single map
+if st.session_state["cv_df"] is not None:
+    for _, row in st.session_state["cv_df"].iterrows():
+        la = float(row["lat"])
+        lo = float(row["lon"])
+        p = row.get("p_wildfire", None)
+
+        if p is None or (isinstance(p, float) and np.isnan(p)):
+            color = "gray"
+            popup = f"{row['point']}: error"
+        else:
+            p = float(p)
+            color = "red" if p >= LIKELY_THRESHOLD else "blue"
+            popup = f"{row['point']}: p={p:.3f}"
+
+        CircleMarker(
+            location=(la, lo),
+            radius=8 if row["point"] != "center" else 10,
+            color=color,
+            fill=True,
+            fill_opacity=0.8,
+            popup=popup,
+        ).add_to(main_map)
+
+legend = """
 <div style="position:fixed;bottom:28px;right:28px;z-index:9999;
             background:#ffffff;border:1px solid #cccccc;border-radius:10px;
             padding:12px 16px;font-size:12px;color:#333333;">
-  <b>Fire Risk (LSTM)</b><br>
-  <span style="color:#cc2222">■</span> High ≥ 0.75<br>
-  <span style="color:#dd8800">■</span> Moderate ≥ 0.50<br>
-  <span style="color:#eecc00">■</span> Low ≥ 0.25<br>
-  <span style="color:#33aa33">■</span> Minimal &lt; 0.25
+  <b>Legend</b><br>
+  <span style="color:#cc2222">■</span> LSTM high risk<br>
+  <span style="color:#dd8800">■</span> LSTM moderate risk<br>
+  <span style="color:#eecc00">■</span> LSTM low risk<br>
+  <span style="color:#33aa33">■</span> LSTM minimal risk<br>
+  <hr style="margin:6px 0;">
+  <span style="color:red">●</span> CV tile ≥ 0.80<br>
+  <span style="color:blue">●</span> CV tile &lt; 0.80<br>
+  <span style="color:gray">●</span> CV tile error
 </div>
 """
-pick_map.get_root().html.add_child(Element(legend))
+main_map.get_root().html.add_child(Element(legend))
 
-picked = st_folium(pick_map, width=950, height=540, key="pick_map")
+picked = st_folium(main_map, width=950, height=540, key="main_map")
 
 if picked and picked.get("last_clicked"):
     new_lat = round(float(picked["last_clicked"]["lat"]), 6)
@@ -562,6 +632,7 @@ if want_cv:
                     )
         st.session_state["cv_df"] = pd.DataFrame(rows)
         st.session_state["cv_imgs"] = imgs
+        rerun_app()
     except Exception as e:
         st.error(f"Computer-vision pipeline failed: {e}")
 
@@ -581,6 +652,8 @@ if want_lstm:
 
         with st.spinner("Running LSTM inference…"):
             st.session_state["lstm_prob"] = run_lstm(lstm_model, scaler, era5_df)
+
+        rerun_app()
     except Exception as e:
         st.error(f"Meteorological pipeline failed: {e}")
 
@@ -603,7 +676,9 @@ else:
             center_row = cv_df.loc[cv_df["point"] == "center", "p_wildfire"]
             center_p = center_row.iloc[0] if not center_row.empty else np.nan
             st.markdown(f"### {emoji}")
-            st.write(f"Likely fire tiles: **{likely_count} / 5** (threshold ≥ {LIKELY_THRESHOLD:.1f})")
+            st.write(
+                f"Likely fire tiles: **{likely_count} / 5** (threshold ≥ {LIKELY_THRESHOLD:.1f})"
+            )
             if pd.notna(center_p):
                 st.metric("Center tile probability", f"{float(center_p):.3f}")
             st.write(msg)
@@ -653,33 +728,9 @@ else:
                         caption += f"p={p:.3f}" if p is not None else "p=None"
                         st.image(img, caption=caption, use_container_width=True)
             else:
-                st.warning("No images were produced. Check the errors in the table above.")
-
-            st.markdown("**Prediction map (5 points)**")
-            result_map = folium.Map(
-                location=list(st.session_state["selected_center"]),
-                zoom_start=DEFAULT_ZOOM_RESULT,
-                tiles="OpenStreetMap",
-            )
-            for _, row in df.iterrows():
-                la = float(row["lat"])
-                lo = float(row["lon"])
-                p = row.get("p_wildfire", None)
-                if p is None or (isinstance(p, float) and np.isnan(p)):
-                    color = "gray"
-                    popup = f"{row['point']}: error"
-                else:
-                    color = "red" if float(p) >= LIKELY_THRESHOLD else "blue"
-                    popup = f"{row['point']}: p={float(p):.3f}"
-                CircleMarker(
-                    location=(la, lo),
-                    radius=10,
-                    color=color,
-                    fill=True,
-                    fill_opacity=0.7,
-                    popup=popup,
-                ).add_to(result_map)
-            st_folium(result_map, width=950, height=520, key="cv_result_map")
+                st.warning(
+                    "No images were produced. Check the errors in the table above."
+                )
 
     with tab_lstm:
         if st.session_state["lstm_prob"] is None:
