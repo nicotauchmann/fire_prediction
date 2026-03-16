@@ -1,3 +1,4 @@
+import base64
 import io
 import math
 import os
@@ -14,9 +15,9 @@ import pandas as pd
 import requests
 import streamlit as st
 import xarray as xr
-from PIL import Image
-from branca.element import MacroElement, Template
+from PIL import Image, ImageDraw
 from folium import CircleMarker, Marker
+from folium.plugins import FloatImage
 from streamlit_folium import st_folium
 
 
@@ -98,39 +99,135 @@ def latest_era5_reference_date() -> datetime:
     return datetime.utcnow().replace(day=1) - timedelta(days=90)
 
 
-def add_map_legend(map_obj):
-    template = """
-    {% macro html(this, kwargs) %}
-    <div style="
-        position: absolute;
-        bottom: 20px;
-        right: 20px;
-        z-index: 9999;
-        background: rgba(255,255,255,0.92);
-        border: 1px solid #bdbdbd;
-        border-radius: 10px;
-        padding: 10px 12px;
-        font-size: 12px;
-        color: #333333;
-        box-shadow: 0 1px 6px rgba(0,0,0,0.25);
-        line-height: 1.35;
-        pointer-events: none;
-    ">
-      <div style="font-weight:700; margin-bottom:6px;">Legend</div>
-      <div><span style="color:#cc2222;">■</span> LSTM high risk</div>
-      <div><span style="color:#dd8800;">■</span> LSTM moderate risk</div>
-      <div><span style="color:#eecc00;">■</span> LSTM low risk</div>
-      <div><span style="color:#33aa33;">■</span> LSTM minimal risk</div>
-      <div style="margin:6px 0; border-top:1px solid #d0d0d0;"></div>
-      <div><span style="color:red;">●</span> CV tile ≥ 0.80</div>
-      <div><span style="color:blue;">●</span> CV tile &lt; 0.80</div>
-      <div><span style="color:gray;">●</span> CV tile error</div>
-    </div>
-    {% endmacro %}
+def h3_polygon_coords(cell: str):
+    boundary = h3.cell_to_boundary(cell)
+    return [(lat, lon) for lat, lon in boundary]
+
+
+def point_in_polygon(lat: float, lon: float, polygon):
     """
-    macro = MacroElement()
-    macro._template = Template(template)
-    map_obj.get_root().add_child(macro)
+    Ray-casting point in polygon.
+    polygon: list of (lat, lon)
+    """
+    x = lon
+    y = lat
+    inside = False
+    n = len(polygon)
+
+    for i in range(n):
+        y1, x1 = polygon[i]
+        y2, x2 = polygon[(i + 1) % n]
+
+        intersects = ((y1 > y) != (y2 > y)) and (
+            x < (x2 - x1) * (y - y1) / ((y2 - y1) + 1e-12) + x1
+        )
+        if intersects:
+            inside = not inside
+
+    return inside
+
+
+@st.cache_data(show_spinner=False)
+def cv_points_for_h3_cell(cell: str, spacing_km: float = SPACING_KM):
+    """
+    Generate extraction points spaced ~3 km apart, anchored on the H3 cell center,
+    clipped to the selected H3 cell polygon.
+    """
+    center_lat, center_lon = h3.cell_to_latlng(cell)
+    center_lat = float(center_lat)
+    center_lon = float(center_lon)
+
+    polygon = h3_polygon_coords(cell)
+    poly_lats = [p[0] for p in polygon]
+    poly_lons = [p[1] for p in polygon]
+
+    dlat = spacing_km / 110.574
+    dlon = spacing_km / (111.320 * math.cos(math.radians(center_lat)))
+
+    lat_span = max(abs(max(poly_lats) - center_lat), abs(center_lat - min(poly_lats)))
+    lon_span = max(abs(max(poly_lons) - center_lon), abs(center_lon - min(poly_lons)))
+
+    n_lat = max(1, int(math.ceil(lat_span / dlat)) + 1)
+    n_lon = max(1, int(math.ceil(lon_span / dlon)) + 1)
+
+    raw_points = []
+    for i in range(-n_lat, n_lat + 1):
+        for j in range(-n_lon, n_lon + 1):
+            la = center_lat + i * dlat
+            lo = center_lon + j * dlon
+            if point_in_polygon(la, lo, polygon):
+                raw_points.append((i, j, la, lo))
+
+    # ensure the H3 cell centre is always included
+    if not any(i == 0 and j == 0 for i, j, _, _ in raw_points):
+        raw_points.append((0, 0, center_lat, center_lon))
+
+    raw_points.sort(
+        key=lambda t: (
+            t[0] ** 2 + t[1] ** 2,
+            abs(t[0]),
+            abs(t[1]),
+            t[0],
+            t[1],
+        )
+    )
+
+    points = []
+    counter = 1
+    for i, j, la, lo in raw_points:
+        if i == 0 and j == 0:
+            name = "center"
+        else:
+            name = f"p{counter:02d}"
+            counter += 1
+        points.append((name, round(la, 6), round(lo, 6)))
+
+    return points
+
+
+@st.cache_data(show_spinner=False)
+def build_legend_data_uri():
+    w, h = 270, 190
+    img = Image.new("RGBA", (w, h), (255, 255, 255, 235))
+    draw = ImageDraw.Draw(img)
+
+    draw.rectangle((0, 0, w - 1, h - 1), outline=(190, 190, 190, 255), width=1)
+
+    x0 = 12
+    y = 10
+    draw.text((x0, y), "Legend", fill=(20, 20, 20, 255))
+    y += 24
+
+    items = [
+        ("#cc2222", "■", "LSTM high risk"),
+        ("#dd8800", "■", "LSTM moderate risk"),
+        ("#eecc00", "■", "LSTM low risk"),
+        ("#33aa33", "■", "LSTM minimal risk"),
+        (None, None, None),
+        ("#ff0000", "●", "CV tile ≥ 0.80"),
+        ("#0000ff", "●", "CV tile < 0.80"),
+        ("#808080", "●", "CV tile error"),
+    ]
+
+    for color, symbol, label in items:
+        if symbol is None:
+            draw.line((x0, y + 4, w - 12, y + 4), fill=(210, 210, 210, 255), width=1)
+            y += 14
+            continue
+
+        draw.text((x0, y), symbol, fill=color)
+        draw.text((x0 + 18, y), label, fill=(50, 50, 50, 255))
+        y += 20
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def add_map_legend(map_obj):
+    legend_uri = build_legend_data_uri()
+    FloatImage(legend_uri, bottom=3, left=74).add_to(map_obj)
 
 
 # ============================================================
@@ -155,19 +252,6 @@ def build_mapbox_url(lon: float, lat: float, token: str) -> str:
         f"?access_token={token}&logo=false&attribution=false"
     )
     return base + coords + rest
-
-
-def cross5_from_center(lat: float, lon: float):
-    dlat = SPACING_KM / 110.574
-    dlon = SPACING_KM / (111.320 * math.cos(math.radians(lat)))
-    pts = [
-        ("center", lat, lon),
-        ("north", lat + dlat, lon),
-        ("south", lat - dlat, lon),
-        ("east", lat, lon + dlon),
-        ("west", lat, lon - dlon),
-    ]
-    return [(name, round(la, 6), round(lo, 6)) for name, la, lo in pts]
 
 
 def preprocess_pil(img: Image.Image) -> np.ndarray:
@@ -395,18 +479,14 @@ def risk_info(p: float):
     return "Minimal", "—", "#33aa33"
 
 
-def h3_polygon_coords(cell: str):
-    boundary = h3.cell_to_boundary(cell)
-    return [(lat, lon) for lat, lon in boundary]
-
-
 # ============================================================
 # PAGE / SESSION STATE
 # ============================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(
-    "Click a location once, then run the computer-vision model or the meteorological model."
+    "Click a location. The point snaps to the center of the selected H3 cell. "
+    "That same H3 cell center is used for both workflows."
 )
 
 st.markdown(
@@ -466,6 +546,7 @@ state_defaults = {
     "cv_imgs": [],
     "lstm_prob": None,
     "era5_df": None,
+    "cv_point_count": 0,
 }
 for key, value in state_defaults.items():
     if key not in st.session_state:
@@ -479,16 +560,17 @@ latest_end = latest_era5_reference_date().date()
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.header("Selected location")
-    st.write(f"Exact click: `{sel_lat:.6f}, {sel_lon:.6f}`")
+    st.header("Selected H3 cell")
 
     if st.session_state["h3_cell"]:
         st.write(f"H3 r{H3_RES} cell: `{st.session_state['h3_cell']}`")
         st.write(
-            f"H3 centre: `{st.session_state['cell_lat']:.6f}, {st.session_state['cell_lon']:.6f}`"
+            f"Snapped centre: `{st.session_state['cell_lat']:.6f}, {st.session_state['cell_lon']:.6f}`"
         )
+        planned_points = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
+        st.write(f"CV extraction points: `{len(planned_points)}`")
     else:
-        st.info("Click the map to select a location.")
+        st.info("Click the map to select a cell.")
 
     st.divider()
     st.header("Meteorological settings")
@@ -502,13 +584,18 @@ with st.sidebar:
 
     st.divider()
     run_cv = st.button(
-        "Run computer vision only", type="primary", use_container_width=True
+        "Prediction Using Computervision",
+        type="primary",
+        use_container_width=True,
     )
-    run_lstm_btn = st.button("Run meteorological only", use_container_width=True)
+    run_lstm_btn = st.button(
+        "Prediction Using Meteorological Data",
+        use_container_width=True,
+    )
     clear = st.button("Clear results", use_container_width=True)
 
 if clear:
-    for k in ["cv_df", "cv_imgs", "lstm_prob", "era5_df"]:
+    for k in ["cv_df", "cv_imgs", "lstm_prob", "era5_df", "cv_point_count"]:
         st.session_state[k] = state_defaults[k]
     rerun_app()
 
@@ -528,7 +615,7 @@ main_map = folium.Map(
     height="540px",
 )
 
-Marker(location=[sel_lat, sel_lon], popup="Selected point").add_to(main_map)
+Marker(location=[sel_lat, sel_lon], popup="Snapped H3 centre").add_to(main_map)
 
 if st.session_state["h3_cell"]:
     poly_color = "#4a8a4a"
@@ -552,28 +639,44 @@ if st.session_state["h3_cell"]:
         ),
     ).add_to(main_map)
 
-if st.session_state["cv_df"] is not None:
-    for _, row in st.session_state["cv_df"].iterrows():
-        la = float(row["lat"])
-        lo = float(row["lon"])
-        p = row.get("p_wildfire", None)
+# show planned CV extraction points before prediction,
+# and show colored prediction points after prediction
+if st.session_state["h3_cell"]:
+    planned_points = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
 
-        if p is None or (isinstance(p, float) and np.isnan(p)):
-            color = "gray"
-            popup = f"{row['point']}: error"
-        else:
-            p = float(p)
-            color = "red" if p >= LIKELY_THRESHOLD else "blue"
-            popup = f"{row['point']}: p={p:.3f}"
+    if st.session_state["cv_df"] is None:
+        for name, la, lo in planned_points:
+            CircleMarker(
+                location=(la, lo),
+                radius=4 if name != "center" else 6,
+                color="white",
+                fill=True,
+                fill_color="white",
+                fill_opacity=0.8,
+                popup=name,
+            ).add_to(main_map)
+    else:
+        for _, row in st.session_state["cv_df"].iterrows():
+            la = float(row["lat"])
+            lo = float(row["lon"])
+            p = row.get("p_wildfire", None)
 
-        CircleMarker(
-            location=(la, lo),
-            radius=8 if row["point"] != "center" else 10,
-            color=color,
-            fill=True,
-            fill_opacity=0.8,
-            popup=popup,
-        ).add_to(main_map)
+            if p is None or (isinstance(p, float) and np.isnan(p)):
+                color = "gray"
+                popup = f"{row['point']}: error"
+            else:
+                p = float(p)
+                color = "red" if p >= LIKELY_THRESHOLD else "blue"
+                popup = f"{row['point']}: p={p:.3f}"
+
+            CircleMarker(
+                location=(la, lo),
+                radius=5 if row["point"] != "center" else 7,
+                color=color,
+                fill=True,
+                fill_opacity=0.85,
+                popup=popup,
+            ).add_to(main_map)
 
 add_map_legend(main_map)
 
@@ -582,31 +685,35 @@ picked = st_folium(
     height=540,
     key="main_map",
     use_container_width=True,
+    returned_objects=["last_clicked"],
 )
 
 if picked and picked.get("last_clicked"):
-    new_lat = round(float(picked["last_clicked"]["lat"]), 6)
-    new_lon = round(float(picked["last_clicked"]["lng"]), 6)
-    new_center = (new_lat, new_lon)
+    click_lat = float(picked["last_clicked"]["lat"])
+    click_lon = float(picked["last_clicked"]["lng"])
 
-    new_cell = h3.latlng_to_cell(new_lat, new_lon, H3_RES)
+    new_cell = h3.latlng_to_cell(click_lat, click_lon, H3_RES)
     cell_center = h3.cell_to_latlng(new_cell)
+    snapped_center = (round(float(cell_center[0]), 6), round(float(cell_center[1]), 6))
 
     current_sig = (
         st.session_state["selected_center"],
         st.session_state["h3_cell"],
     )
-    new_sig = (new_center, new_cell)
+    new_sig = (snapped_center, new_cell)
 
     if new_sig != current_sig:
-        st.session_state["selected_center"] = new_center
+        st.session_state["selected_center"] = snapped_center
         st.session_state["h3_cell"] = new_cell
-        st.session_state["cell_lat"] = round(cell_center[0], 6)
-        st.session_state["cell_lon"] = round(cell_center[1], 6)
+        st.session_state["cell_lat"] = snapped_center[0]
+        st.session_state["cell_lon"] = snapped_center[1]
         st.session_state["cv_df"] = None
         st.session_state["cv_imgs"] = []
         st.session_state["lstm_prob"] = None
         st.session_state["era5_df"] = None
+        st.session_state["cv_point_count"] = len(
+            cv_points_for_h3_cell(new_cell, SPACING_KM)
+        )
         rerun_app()
 
 if st.session_state["h3_cell"] is None:
@@ -621,54 +728,67 @@ want_lstm = run_lstm_btn
 
 if want_cv:
     try:
-        token = get_mapbox_token()
-        with st.spinner("Loading computer-vision model…"):
-            cv_model = load_cv_model_cached()
+        if st.session_state["h3_cell"] is None:
+            st.error("Please click on the map first to select an H3 cell.")
+        else:
+            token = get_mapbox_token()
+            with st.spinner("Loading computer-vision model…"):
+                cv_model = load_cv_model_cached()
 
-        pts = cross5_from_center(*st.session_state["selected_center"])
-        rows = []
-        imgs = []
-        with st.spinner("Downloading Mapbox tiles and running CV predictions…"):
-            for name, la, lo in pts:
-                try:
-                    img = fetch_tile(lo, la, token)
-                    p = predict_wildfire_prob_cv(cv_model, img)
-                    rows.append({"point": name, "lat": la, "lon": lo, "p_wildfire": p})
-                    imgs.append((name, la, lo, p, img))
-                except Exception as e:
-                    rows.append(
-                        {
-                            "point": name,
-                            "lat": la,
-                            "lon": lo,
-                            "p_wildfire": None,
-                            "error": str(e),
-                        }
-                    )
-        st.session_state["cv_df"] = pd.DataFrame(rows)
-        st.session_state["cv_imgs"] = imgs
-        rerun_app()
+            pts = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
+
+            rows = []
+            imgs = []
+            with st.spinner("Downloading satellite images and running CV predictions…"):
+                for name, la, lo in pts:
+                    try:
+                        img = fetch_tile(lo, la, token)
+                        p = predict_wildfire_prob_cv(cv_model, img)
+                        rows.append(
+                            {"point": name, "lat": la, "lon": lo, "p_wildfire": p}
+                        )
+                        imgs.append((name, la, lo, p, img))
+                    except Exception as e:
+                        rows.append(
+                            {
+                                "point": name,
+                                "lat": la,
+                                "lon": lo,
+                                "p_wildfire": None,
+                                "error": str(e),
+                            }
+                        )
+
+            st.session_state["cv_df"] = pd.DataFrame(rows)
+            st.session_state["cv_imgs"] = imgs
+            st.session_state["cv_point_count"] = len(pts)
+            rerun_app()
+
     except Exception as e:
         st.error(f"Computer-vision pipeline failed: {e}")
 
 if want_lstm:
     try:
-        with st.spinner("Loading meteorological model…"):
-            lstm_model = load_lstm_model_cached()
-            scaler = load_scaler_cached()
+        if st.session_state["h3_cell"] is None:
+            st.error("Please click on the map first to select an H3 cell.")
+        else:
+            with st.spinner("Loading meteorological model…"):
+                lstm_model = load_lstm_model_cached()
+                scaler = load_scaler_cached()
 
-        cell_lat = st.session_state["cell_lat"]
-        cell_lon = st.session_state["cell_lon"]
-        end_str = end_date.strftime("%Y-%m-%d")
+            cell_lat = st.session_state["cell_lat"]
+            cell_lon = st.session_state["cell_lon"]
+            end_str = end_date.strftime("%Y-%m-%d")
 
-        with st.spinner("Fetching ERA5-Land monthly means…"):
-            era5_df = fetch_era5_sequence(cell_lat, cell_lon, end_str)
-            st.session_state["era5_df"] = era5_df
+            with st.spinner("Fetching ERA5-Land monthly means…"):
+                era5_df = fetch_era5_sequence(cell_lat, cell_lon, end_str)
+                st.session_state["era5_df"] = era5_df
 
-        with st.spinner("Running LSTM inference…"):
-            st.session_state["lstm_prob"] = run_lstm(lstm_model, scaler, era5_df)
+            with st.spinner("Running LSTM inference…"):
+                st.session_state["lstm_prob"] = run_lstm(lstm_model, scaler, era5_df)
 
-        rerun_app()
+            rerun_app()
+
     except Exception as e:
         st.error(f"Meteorological pipeline failed: {e}")
 
@@ -691,10 +811,13 @@ else:
             likely_count, stars, emoji, msg = compute_fire_rating(cv_df)
             center_row = cv_df.loc[cv_df["point"] == "center", "p_wildfire"]
             center_p = center_row.iloc[0] if not center_row.empty else np.nan
+
             st.markdown(f"### {emoji}")
             st.write(
-                f"Likely fire tiles: **{likely_count} / 5** (threshold ≥ {LIKELY_THRESHOLD:.1f})"
+                f"Likely fire tiles: **{likely_count} / {len(cv_df)}** "
+                f"(threshold ≥ {LIKELY_THRESHOLD:.1f})"
             )
+            st.write(f"Downloaded images: **{len(cv_df)}**")
             if pd.notna(center_p):
                 st.metric("Center tile probability", f"{float(center_p):.3f}")
             st.write(msg)
@@ -727,22 +850,27 @@ else:
             df = st.session_state["cv_df"].copy()
             imgs = st.session_state.get("cv_imgs", [])
 
+            st.write(f"Extraction points used: **{len(df)}**")
             st.dataframe(df, use_container_width=True)
+
             st.download_button(
                 "Download CV CSV",
                 data=df.to_csv(index=False).encode("utf-8"),
-                file_name="wildfire_predictions_cv_5points.csv",
+                file_name="wildfire_predictions_cv_h3cell.csv",
                 mime="text/csv",
             )
 
             st.markdown("**Satellite images**")
             if imgs:
-                cols = st.columns(5)
-                for i, (name, la, lo, p, img) in enumerate(imgs):
-                    with cols[i]:
-                        caption = f"{name}\n{lo:.6f}, {la:.6f}\n"
-                        caption += f"p={p:.3f}" if p is not None else "p=None"
-                        st.image(img, caption=caption, use_container_width=True)
+                n_cols = 4
+                for start in range(0, len(imgs), n_cols):
+                    cols = st.columns(n_cols)
+                    for col, item in zip(cols, imgs[start : start + n_cols]):
+                        name, la, lo, p, img = item
+                        with col:
+                            caption = f"{name}\n{lo:.6f}, {la:.6f}\n"
+                            caption += f"p={p:.3f}" if p is not None else "p=None"
+                            st.image(img, caption=caption, use_container_width=True)
             else:
                 st.warning(
                     "No images were produced. Check the errors in the table above."
