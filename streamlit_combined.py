@@ -35,7 +35,7 @@ TILE_SIZE = 350
 RESCALE = 1.0 / 255.0
 SPACING_KM = 3.0
 CV_WILDFIRE_INDEX = 1
-LIKELY_THRESHOLD = 0.8
+LIKELY_THRESHOLD = 0.85
 CV_MODEL_PATH = Path("saved_model") / "vgg16_model.keras"
 
 # --- Meteorological / ERA5 + LSTM ---
@@ -273,13 +273,13 @@ def compute_fire_rating(df: pd.DataFrame, threshold: float = LIKELY_THRESHOLD):
     probs = pd.to_numeric(df.get("p_wildfire"), errors="coerce")
     likely_count = int((probs >= threshold).sum())
 
-    if likely_count == 0:
+    if likely_count in (1, 2, 3, 4, 5, 6, 7, 8):
         stars = 0
         msg = "A fire is unlikely in this environment."
-    elif likely_count == 1:
+    elif likely_count in (9, 10, 11, 12, 13, 14, 15, 16, 17):
         stars = 1
         msg = "The fire potential of this environment is low."
-    elif likely_count in (2, 3):
+    elif likely_count in (18, 19, 20, 21, 22, 23, 24, 25, 26):
         stars = 2
         msg = "The fire potential of this environment is moderate. Check local safety precautions."
     else:
