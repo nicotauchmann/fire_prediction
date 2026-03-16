@@ -15,7 +15,7 @@ import requests
 import streamlit as st
 import xarray as xr
 from PIL import Image
-from branca.element import Element, MacroElement, Template
+from branca.element import MacroElement, Template
 from folium import CircleMarker, Marker
 from streamlit_folium import st_folium
 
@@ -114,6 +114,7 @@ def add_map_legend(map_obj):
         color: #333333;
         box-shadow: 0 1px 6px rgba(0,0,0,0.25);
         line-height: 1.35;
+        pointer-events: none;
     ">
       <div style="font-weight:700; margin-bottom:6px;">Legend</div>
       <div><span style="color:#cc2222;">■</span> LSTM high risk</div>
@@ -130,25 +131,6 @@ def add_map_legend(map_obj):
     macro = MacroElement()
     macro._template = Template(template)
     map_obj.get_root().add_child(macro)
-
-
-def add_map_resize_fix(map_obj):
-    map_name = map_obj.get_name()
-    resize_js = f"""
-    <script>
-    setTimeout(function() {{
-        try {{
-            {map_name}.invalidateSize(true);
-        }} catch (e) {{}}
-    }}, 300);
-    setTimeout(function() {{
-        try {{
-            {map_name}.invalidateSize(true);
-        }} catch (e) {{}}
-    }}, 900);
-    </script>
-    """
-    map_obj.get_root().html.add_child(Element(resize_js))
 
 
 # ============================================================
@@ -424,7 +406,7 @@ def h3_polygon_coords(cell: str):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(
-    "Click a location once, then run the computer-vision model, the meteorological model, or both."
+    "Click a location once, then run the computer-vision model or the meteorological model."
 )
 
 st.markdown(
@@ -519,8 +501,9 @@ with st.sidebar:
     st.caption(f"This fetches the last {SEQ_LEN} monthly time steps.")
 
     st.divider()
-    run_both = st.button("Run both models", type="primary", use_container_width=True)
-    run_cv = st.button("Run computer vision only", use_container_width=True)
+    run_cv = st.button(
+        "Run computer vision only", type="primary", use_container_width=True
+    )
     run_lstm_btn = st.button("Run meteorological only", use_container_width=True)
     clear = st.button("Clear results", use_container_width=True)
 
@@ -541,6 +524,8 @@ main_map = folium.Map(
     tiles=ESRI_TILE_URL,
     attr=ESRI_ATTR,
     control_scale=True,
+    width="100%",
+    height="540px",
 )
 
 Marker(location=[sel_lat, sel_lon], popup="Selected point").add_to(main_map)
@@ -591,9 +576,13 @@ if st.session_state["cv_df"] is not None:
         ).add_to(main_map)
 
 add_map_legend(main_map)
-add_map_resize_fix(main_map)
 
-picked = st_folium(main_map, width=950, height=540, key="main_map")
+picked = st_folium(
+    main_map,
+    height=540,
+    key="main_map",
+    use_container_width=True,
+)
 
 if picked and picked.get("last_clicked"):
     new_lat = round(float(picked["last_clicked"]["lat"]), 6)
@@ -627,8 +616,8 @@ if st.session_state["h3_cell"] is None:
 # ============================================================
 # RUN MODELS
 # ============================================================
-want_cv = run_cv or run_both
-want_lstm = run_lstm_btn or run_both
+want_cv = run_cv
+want_lstm = run_lstm_btn
 
 if want_cv:
     try:
