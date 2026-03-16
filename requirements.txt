@@ -1,0 +1,16 @@
+streamlit
+tensorflow
+numpy
+pandas
+requests
+pillow
+folium
+streamlit-folium
+h3
+cdsapi
+xarray
+netcdf4
+cfgrib
+eccodes
+scikit-learn
+h5py
