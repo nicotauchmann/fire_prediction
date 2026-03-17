@@ -96,8 +96,21 @@ def secret_or_env(name: str, default: str = "") -> str:
     return (value or "").strip()
 
 
-def latest_era5_reference_date() -> datetime:
-    return datetime.utcnow().replace(day=1) - timedelta(days=30)
+def end_of_month(d: datetime) -> datetime:
+    """Return last day (UTC) of the month containing datetime d."""
+    d = d.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_month = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return next_month - timedelta(days=1)
+
+
+def heuristic_latest_era5_date() -> datetime:
+    """
+    Safe fallback: assume last complete month is available.
+    (Much better than 'today', avoids most CDS 'not available' errors.)
+    """
+    now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    first_this_month = now.replace(day=1)
+    return first_this_month - timedelta(days=1)  # last day of previous month
 
 
 def h3_polygon_coords(cell: str):
@@ -246,6 +259,105 @@ def render_result_card(title: str, body_html: str):
 
 
 # ============================================================
+# CDS / ERA5 AVAILABILITY (Option C)
+# ============================================================
+def get_cds_client():
+    url = secret_or_env("CDS_URL")
+    key = secret_or_env("CDS_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "CDS credentials are missing. Add CDS_URL and CDS_KEY to Streamlit secrets."
+        )
+    return cdsapi.Client(url=url, key=key, quiet=True)
+
+
+def _probe_era5_month_available(client: cdsapi.Client, year: str, month: str) -> bool:
+    """
+    Try a tiny CDS download for the given year/month. If CDS says the request isn't available yet,
+    return False. Otherwise return True when download works.
+    """
+    # small bbox, one variable = tiny file
+    area = [1.0, 1.0, 0.0, 0.0]  # N, W, S, E
+
+    req = {
+        "product_type": "monthly_averaged_reanalysis",
+        "variable": ["2m_temperature"],
+        "year": [year],
+        "month": [month],
+        "time": "00:00",
+        "area": area,
+        "format": "netcdf",
+    }
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        client.retrieve("reanalysis-era5-land-monthly-means", req, tmp_path)
+
+        ok = os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0
+        return bool(ok)
+
+    except Exception as e:
+        msg = str(e).lower()
+        # CDS commonly reports "not available", "no data", etc. (exact wording varies)
+        not_ready_markers = [
+            "not available",
+            "no data",
+            "no result",
+            "not found",
+            "does not exist",
+            "not in the catalogue",
+            "request is not in the archive",
+            "nothing to retrieve",
+        ]
+        if any(m in msg for m in not_ready_markers):
+            return False
+        # For any other error (network hiccup etc.), treat as "unknown/unavailable"
+        # and let the caller decide fallback.
+        return False
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def latest_era5_available_date() -> datetime:
+    """
+    Finds the latest month that CDS can actually deliver for
+    'reanalysis-era5-land-monthly-means' by probing months backwards.
+
+    Returns a datetime set to the last day of the latest available month (UTC).
+    Cached for 24 hours to avoid repeated CDS calls on reruns.
+    """
+    try:
+        client = get_cds_client()
+    except Exception:
+        return heuristic_latest_era5_date()
+
+    now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    d = now.replace(day=1)  # start at current month
+
+    # Probe up to 36 months back (safeguard)
+    for _ in range(36):
+        year = str(d.year)
+        month = str(d.month).zfill(2)
+
+        if _probe_era5_month_available(client, year, month):
+            return end_of_month(d)
+
+        # previous month
+        d = (d - timedelta(days=1)).replace(day=1)
+
+    return heuristic_latest_era5_date()
+
+
+# ============================================================
 # COMPUTER VISION HELPERS
 # ============================================================
 def get_mapbox_token() -> str:
@@ -334,16 +446,6 @@ def fetch_tile(lon: float, lat: float, token: str) -> Image.Image:
 # ============================================================
 # LSTM / ERA5 HELPERS
 # ============================================================
-def get_cds_client():
-    url = secret_or_env("CDS_URL")
-    key = secret_or_env("CDS_KEY")
-    if not url or not key:
-        raise RuntimeError(
-            "CDS credentials are missing. Add CDS_URL and CDS_KEY to Streamlit secrets."
-        )
-    return cdsapi.Client(url=url, key=key, quiet=True)
-
-
 @st.cache_resource(show_spinner=False)
 def load_lstm_model_cached():
     import tensorflow as tf
@@ -368,7 +470,7 @@ def load_scaler_cached():
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFrame:
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
-    latest = latest_era5_reference_date()
+    latest = latest_era5_available_date()
     if end > latest:
         end = latest
 
@@ -568,7 +670,10 @@ for key, value in state_defaults.items():
         st.session_state[key] = value
 
 sel_lat, sel_lon = st.session_state["selected_center"]
-latest_end = latest_era5_reference_date().date()
+
+# (Option C) compute latest end date by probing CDS (cached)
+latest_end_dt = latest_era5_available_date()
+latest_end = latest_end_dt.date()
 
 
 # ============================================================
@@ -593,7 +698,10 @@ with st.sidebar:
         "Sequence end date",
         value=latest_end,
         max_value=latest_end,
-        help="ERA5-Land monthly means are delayed, so the newest selectable date is clamped.",
+        help=(
+            "This maximum is detected by probing CDS for the latest available "
+            "ERA5-Land monthly means month."
+        ),
     )
     st.caption(f"This fetches the last {SEQ_LEN} monthly time steps.")
 
