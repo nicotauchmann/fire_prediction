@@ -204,8 +204,8 @@ def build_legend_data_uri():
         ("#eecc00", "■", "LSTM low risk"),
         ("#33aa33", "■", "LSTM minimal risk"),
         (None, None, None),
-        ("#ff0000", "●", "CV tile ≥ 0.80"),
-        ("#0000ff", "●", "CV tile < 0.80"),
+        ("#ff0000", "●", "CV tile ≥ 0.90"),
+        ("#0000ff", "●", "CV tile < 0.90"),
         ("#808080", "●", "CV tile error"),
     ]
 
