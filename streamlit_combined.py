@@ -200,14 +200,14 @@ def build_legend_data_uri():
     y += 24
 
     items = [
-        ("#cc2222", "[■]", "LSTM high risk"),
-        ("#dd8800", "[■]", "LSTM moderate risk"),
-        ("#eecc00", "[■]", "LSTM low risk"),
-        ("#33aa33", "[■]", "LSTM minimal risk"),
+        ("#cc2222", "■", "LSTM high risk"),
+        ("#dd8800", "■", "LSTM moderate risk"),
+        ("#eecc00", "■", "LSTM low risk"),
+        ("#33aa33", "■", "LSTM minimal risk"),
         (None, None, None),
-        ("#ff0000", "(o)", "CV tile ≥ 0.90"),
-        ("#0000ff", "(o)", "CV tile < 0.90"),
-        ("#808080", "(o)", "CV tile error"),
+        ("#ff0000", "o", "CV tile ≥ 0.90"),
+        ("#0000ff", "o", "CV tile < 0.90"),
+        ("#808080", "o", "CV tile error"),
     ]
 
     for color, symbol, label in items:
