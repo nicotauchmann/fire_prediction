@@ -1,4 +1,5 @@
 import base64
+import html
 import io
 import math
 import os
@@ -199,14 +200,14 @@ def build_legend_data_uri():
     y += 24
 
     items = [
-        ("#cc2222", "■", "LSTM high risk"),
-        ("#dd8800", "■", "LSTM moderate risk"),
-        ("#eecc00", "■", "LSTM low risk"),
-        ("#33aa33", "■", "LSTM minimal risk"),
+        ("#cc2222", "[■]", "LSTM high risk"),
+        ("#dd8800", "[■]", "LSTM moderate risk"),
+        ("#eecc00", "[■]", "LSTM low risk"),
+        ("#33aa33", "[■]", "LSTM minimal risk"),
         (None, None, None),
-        ("#ff0000", "●", "CV tile ≥ 0.90"),
-        ("#0000ff", "●", "CV tile < 0.90"),
-        ("#808080", "●", "CV tile error"),
+        ("#ff0000", "(o)", "CV tile ≥ 0.90"),
+        ("#0000ff", "(o)", "CV tile < 0.90"),
+        ("#808080", "(o)", "CV tile error"),
     ]
 
     for color, symbol, label in items:
@@ -228,6 +229,20 @@ def build_legend_data_uri():
 def add_map_legend(map_obj):
     legend_uri = build_legend_data_uri()
     FloatImage(legend_uri, bottom=3, left=74).add_to(map_obj)
+
+
+def render_result_card(title: str, body_html: str):
+    st.markdown(
+        f"""
+<div class="result-card">
+  <div style="font-weight:800; font-size: 1.05rem; margin-bottom: 8px;">
+    {html.escape(title)}
+  </div>
+  {body_html}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 # ============================================================
@@ -804,42 +819,46 @@ else:
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown('<div class="result-card">', unsafe_allow_html=True)
-        st.markdown("**Computer vision result**")
         if st.session_state["cv_df"] is not None:
             cv_df = st.session_state["cv_df"].copy()
             likely_count, stars, emoji, msg = compute_fire_rating(cv_df)
             center_row = cv_df.loc[cv_df["point"] == "center", "p_wildfire"]
             center_p = center_row.iloc[0] if not center_row.empty else np.nan
 
-            st.markdown(f"### {emoji}")
-            st.write(
-                f"Likely fire tiles: **{likely_count} / {len(cv_df)}** "
-                f"(threshold ≥ {LIKELY_THRESHOLD:.1f})"
+            center_line = (
+                f"<div>Center tile probability: <b>{float(center_p):.3f}</b></div>"
+                if pd.notna(center_p)
+                else "<div>Center tile probability: <b>—</b></div>"
             )
-            st.write(f"Downloaded images: **{len(cv_df)}**")
-            if pd.notna(center_p):
-                st.metric("Center tile probability", f"{float(center_p):.3f}")
-            st.write(msg)
+
+            body = f"""
+<div style="font-size:2.0rem; font-weight:900; margin: 0 0 10px 0;">{html.escape(emoji)}</div>
+<div>Likely fire tiles: <b>{likely_count} / {len(cv_df)}</b> (threshold ≥ {LIKELY_THRESHOLD:.2f})</div>
+<div>Downloaded images: <b>{len(cv_df)}</b></div>
+{center_line}
+<div style="margin-top:8px;">{html.escape(msg)}</div>
+"""
+            render_result_card("Computer vision result", body)
         else:
-            st.caption("Not run yet.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            render_result_card("Computer vision result", "<div>Not run yet.</div>")
 
     with col2:
-        st.markdown('<div class="result-card">', unsafe_allow_html=True)
-        st.markdown("**Meteorological result**")
         if st.session_state["lstm_prob"] is not None:
             p_lstm = float(st.session_state["lstm_prob"])
-            label, emoji, _ = risk_info(p_lstm)
-            st.markdown(f"### {emoji} {label}")
-            st.metric("Fire probability", f"{p_lstm:.3f}")
-            st.write(
-                "Above threshold" if p_lstm >= LSTM_THRESHOLD else "Below threshold"
-            )
-            st.write(f"H3 cell: `{st.session_state['h3_cell']}`")
+            label, emoji, color = risk_info(p_lstm)
+            above = "Above threshold" if p_lstm >= LSTM_THRESHOLD else "Below threshold"
+
+            body = f"""
+<div style="font-size:1.8rem; font-weight:900; color:{html.escape(color)}; margin: 0 0 8px 0;">
+  {html.escape(emoji)} {html.escape(label)}
+</div>
+<div>Fire probability: <b>{p_lstm:.3f}</b></div>
+<div>{html.escape(above)} (threshold = {LSTM_THRESHOLD:.2f})</div>
+<div style="margin-top:8px;">H3 cell: <code>{html.escape(str(st.session_state['h3_cell']))}</code></div>
+"""
+            render_result_card("Meteorological result", body)
         else:
-            st.caption("Not run yet.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            render_result_card("Meteorological result", "<div>Not run yet.</div>")
 
     tab_cv, tab_lstm = st.tabs(["Computer vision details", "Meteorological details"])
 
