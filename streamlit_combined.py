@@ -96,7 +96,7 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 def latest_era5_reference_date() -> datetime:
-    return datetime.utcnow().replace(day=1) - timedelta(days=45)
+    return datetime.utcnow().replace(day=1) - timedelta(days=30)
 
 
 def h3_polygon_coords(cell: str):
