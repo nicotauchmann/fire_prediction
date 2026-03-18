@@ -461,10 +461,9 @@ def load_lstm_model_cached():
 def load_scaler_cached():
     if not SCALER_PATH.exists():
         return None
-    import pickle
+    import joblib
 
-    with open(SCALER_PATH, "rb") as f:
-        return pickle.load(f)
+        return joblib.load(SCALER_PATH)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
