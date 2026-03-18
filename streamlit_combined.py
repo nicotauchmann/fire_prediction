@@ -463,7 +463,7 @@ def load_scaler_cached():
         return None
     import joblib
 
-        return joblib.load(SCALER_PATH)
+    return joblib.load(SCALER_PATH)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
