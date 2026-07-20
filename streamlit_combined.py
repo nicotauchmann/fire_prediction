@@ -3,7 +3,9 @@ import html
 import io
 import math
 import os
+import shutil
 import tempfile
+import time
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -262,107 +264,129 @@ def render_result_card(title: str, body_html: str):
 # CDS / ERA5 AVAILABILITY (Option C)
 # ============================================================
 def get_cds_client():
+    """Create a CDS client with bounded retries and a generous timeout."""
     url = secret_or_env("CDS_URL")
     key = secret_or_env("CDS_KEY")
+
     if not url or not key:
         raise RuntimeError(
-            "CDS credentials are missing. Add CDS_URL and CDS_KEY to Streamlit secrets."
+            "CDS credentials are missing. Add CDS_URL and CDS_KEY "
+            "to Streamlit secrets."
         )
-    return cdsapi.Client(url=url, key=key, quiet=True)
+
+    return cdsapi.Client(
+        url=url,
+        key=key,
+        quiet=False,
+        debug=False,
+        timeout=600,
+        retry_max=3,
+        sleep_max=15,
+    )
 
 
-def _probe_era5_month_available(client: cdsapi.Client, year: str, month: str) -> bool:
+def _is_transient_cds_error(exc: Exception) -> bool:
+    """Return True for connection errors that are reasonable to retry."""
+    message = str(exc).lower()
+    transient_markers = (
+        "ssl",
+        "unexpected_eof",
+        "eof occurred",
+        "connection reset",
+        "connection aborted",
+        "remote disconnected",
+        "max retries exceeded",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "timed out",
+        "timeout",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in message for marker in transient_markers)
+
+
+def retrieve_cds_with_retry(
+    dataset: str,
+    request: dict,
+    target_path: str,
+    attempts: int = 3,
+) -> None:
     """
-    Try a tiny CDS download for the given year/month. If CDS says the request isn't available yet,
-    return False. Otherwise return True when download works.
+    Submit and download a CDS request, recreating the client/session after
+    transient SSL or network failures.
     """
-    # small bbox, one variable = tiny file
-    area = [1.0, 1.0, 0.0, 0.0]  # N, W, S, E
+    last_error = None
 
-    req = {
-        "product_type": ["monthly_averaged_reanalysis"],    
-        "variable": ["2m_temperature"],
-        "year": [year],
-        "month": [month],
-        "time": ["00:00"],
-        "area": area,
-        "data_format": "netcdf",
-        "download_format": "unarchived",
-    }
+    for attempt in range(1, attempts + 1):
+        try:
+            if os.path.exists(target_path):
+                os.unlink(target_path)
+
+            client = get_cds_client()
+            client.retrieve(dataset, request, target_path)
+
+            if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
+                raise RuntimeError("CDS returned an empty download.")
+
+            return
+
+        except Exception as exc:
+            last_error = exc
+            should_retry = _is_transient_cds_error(exc) and attempt < attempts
+
+            if not should_retry:
+                raise RuntimeError(
+                    f"CDS request failed on attempt {attempt}/{attempts}: {exc}"
+                ) from exc
+
+            # Short application-level backoff. cdsapi also performs bounded
+            # internal retries, while this retry recreates its HTTP session.
+            time.sleep(min(5 * (2 ** (attempt - 1)), 20))
+
+    raise RuntimeError(f"CDS request failed after {attempts} attempts: {last_error}")
 
 
+def open_cds_download(download_path: str, extract_dir: str) -> xr.Dataset:
+    """Open a CDS NetCDF download, including the ZIP response fallback."""
+    if zipfile.is_zipfile(download_path):
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(download_path, "r") as archive:
+            archive.extractall(extract_dir)
 
+        candidates = sorted(Path(extract_dir).rglob("*.nc")) + sorted(
+            Path(extract_dir).rglob("*.netcdf")
+        )
+        if not candidates:
+            raise RuntimeError("ZIP from CDS contained no NetCDF file.")
+    else:
+        candidates = [Path(download_path)]
 
-
-
-
-    
-    tmp_path = None
+    datasets = []
     try:
-        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-            tmp_path = tmp.name
+        for candidate in candidates:
+            datasets.append(xr.open_dataset(candidate, engine="netcdf4"))
 
-        client.retrieve("reanalysis-era5-land-monthly-means", req, tmp_path)
+        if len(datasets) == 1:
+            # Load before returning so the temporary file can safely be deleted.
+            result = datasets[0].load()
+        else:
+            # Some CDS responses contain one NetCDF file per variable.
+            result = xr.merge(
+                [dataset.load() for dataset in datasets],
+                compat="override",
+                join="outer",
+            )
 
-        ok = os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0
-        return bool(ok)
-
-    except Exception as e:
-        msg = str(e).lower()
-        # CDS commonly reports "not available", "no data", etc. (exact wording varies)
-        not_ready_markers = [
-            "not available",
-            "no data",
-            "no result",
-            "not found",
-            "does not exist",
-            "not in the catalogue",
-            "request is not in the archive",
-            "nothing to retrieve",
-        ]
-        if any(m in msg for m in not_ready_markers):
-            return False
-        # For any other error (network hiccup etc.), treat as "unknown/unavailable"
-        # and let the caller decide fallback.
-        return False
-
+        return result
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def latest_era5_available_date() -> datetime:
-    """
-    Finds the latest month that CDS can actually deliver for
-    'reanalysis-era5-land-monthly-means' by probing months backwards.
-
-    Returns a datetime set to the last day of the latest available month (UTC).
-    Cached for 24 hours to avoid repeated CDS calls on reruns.
-    """
-    try:
-        client = get_cds_client()
-    except Exception:
-        return heuristic_latest_era5_date()
-
-    now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    d = now.replace(day=1)  # start at current month
-
-    # Probe up to 36 months back (safeguard)
-    for _ in range(36):
-        year = str(d.year)
-        month = str(d.month).zfill(2)
-
-        if _probe_era5_month_available(client, year, month):
-            return end_of_month(d)
-
-        # previous month
-        d = (d - timedelta(days=1)).replace(day=1)
-
-    return heuristic_latest_era5_date()
+        for dataset in datasets:
+            dataset.close()
 
 
 # ============================================================
@@ -476,23 +500,37 @@ def load_scaler_cached():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFrame:
+    """
+    Download exactly SEQ_LEN monthly ERA5-Land observations for one point.
+
+    Requests are split by calendar year. This avoids the CDS year/month
+    cross-product, reduces request size, and makes retries more reliable.
+    """
     end = datetime.strptime(end_date_str, "%Y-%m-%d")
-    latest = latest_era5_available_date()
+    latest = heuristic_latest_era5_date()
     if end > latest:
         end = latest
 
     months_list = []
-    d = end.replace(day=1)
+    current_month = end.replace(day=1)
     for _ in range(SEQ_LEN):
-        months_list.append(d)
-        if d.month == 1:
-            d = d.replace(year=d.year - 1, month=12)
+        months_list.append(current_month)
+        if current_month.month == 1:
+            current_month = current_month.replace(
+                year=current_month.year - 1,
+                month=12,
+            )
         else:
-            d = d.replace(month=d.month - 1)
+            current_month = current_month.replace(month=current_month.month - 1)
     months_list = sorted(months_list)
 
-    years = sorted({str(d.year) for d in months_list})
-    months = sorted({str(d.month).zfill(2) for d in months_list})
+    months_by_year: dict[str, list[str]] = {}
+    dates_by_year: dict[str, list[datetime]] = {}
+    for month_date in months_list:
+        year = str(month_date.year)
+        month = f"{month_date.month:02d}"
+        months_by_year.setdefault(year, []).append(month)
+        dates_by_year.setdefault(year, []).append(month_date)
 
     area = [
         round(lat + 0.5, 2),
@@ -501,76 +539,131 @@ def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFra
         round(lon + 0.5, 2),
     ]
 
-    client = get_cds_client()
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    client.retrieve(
-        "reanalysis-era5-land-monthly-means",
-        {
-            "product_type": "monthly_averaged_reanalysis",
-            "variable": ERA5_VARIABLES,
-            "year": years,
-            "month": months,
-            "time": "00:00",
-            "area": area,
-            "format": "netcdf",
-        },
-        tmp_path,
-    )
-
-    if zipfile.is_zipfile(tmp_path):
-        extract_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(tmp_path, "r") as zf:
-            zf.extractall(extract_dir)
-        candidates = list(Path(extract_dir).glob("*.nc")) + list(
-            Path(extract_dir).glob("*.netcdf")
-        )
-        if not candidates:
-            raise RuntimeError("ZIP from CDS contained no NetCDF file.")
-        tmp_path = str(candidates[0])
-
-    ds = xr.open_dataset(tmp_path, engine="netcdf4")
-    ds_pt = ds.sel(latitude=lat, longitude=lon, method="nearest")
-    time_coord = "valid_time" if "valid_time" in ds_pt.coords else "time"
-
+    temp_root = tempfile.mkdtemp(prefix="era5_land_")
     records = []
-    for d in months_list:
-        month_str = d.strftime("%Y-%m")
 
-        def _val(var_name: str):
-            try:
-                times = ds_pt[time_coord].values
-                mask = [(str(t)[:7] == month_str) for t in times]
-                idx = next(i for i, m in enumerate(mask) if m)
-                return float(ds_pt[var_name].isel({time_coord: idx}).values)
-            except Exception:
-                return np.nan
+    try:
+        for year in sorted(months_by_year):
+            target_path = os.path.join(temp_root, f"era5_{year}.download")
+            extract_dir = os.path.join(temp_root, f"era5_{year}_extracted")
 
-        u = _val("u10")
-        v = _val("v10")
-        records.append(
-            {
-                "date": month_str,
-                "2m_temperature": _val("t2m"),
-                "volumetric_soil_water_layer_1": _val("swvl1"),
-                "surface_solar_radiation_downwards": _val("ssrd"),
-                "total_evaporation": _val("e"),
-                "wind_total": math.sqrt(u**2 + v**2)
-                if not (np.isnan(u) or np.isnan(v))
-                else np.nan,
-                "total_precipitation": _val("tp"),
-                "leaf_area_index_high_vegetation": _val("lai_hv"),
+            request = {
+                "product_type": ["monthly_averaged_reanalysis"],
+                "variable": ERA5_VARIABLES,
+                "year": [year],
+                "month": sorted(months_by_year[year]),
+                "time": ["00:00"],
+                "area": area,
+                "data_format": "netcdf",
+                "download_format": "unarchived",
             }
+
+            retrieve_cds_with_retry(
+                dataset="reanalysis-era5-land-monthly-means",
+                request=request,
+                target_path=target_path,
+                attempts=3,
+            )
+
+            dataset = open_cds_download(target_path, extract_dir)
+            try:
+                point_dataset = dataset.sel(
+                    latitude=lat,
+                    longitude=lon,
+                    method="nearest",
+                )
+
+                if "valid_time" in point_dataset.coords:
+                    time_coord = "valid_time"
+                elif "time" in point_dataset.coords:
+                    time_coord = "time"
+                else:
+                    raise RuntimeError(
+                        "CDS NetCDF has neither a 'valid_time' nor a 'time' coordinate."
+                    )
+
+                times = point_dataset[time_coord].values
+                month_indices = {
+                    str(value)[:7]: index for index, value in enumerate(times)
+                }
+
+                def value_for_month(var_name: str, month_str: str) -> float:
+                    if var_name not in point_dataset:
+                        return np.nan
+
+                    index = month_indices.get(month_str)
+                    if index is None:
+                        return np.nan
+
+                    try:
+                        value = point_dataset[var_name].isel(
+                            {time_coord: index}
+                        ).values
+                        return float(np.asarray(value).squeeze())
+                    except Exception:
+                        return np.nan
+
+                for month_date in dates_by_year[year]:
+                    month_str = month_date.strftime("%Y-%m")
+                    u = value_for_month("u10", month_str)
+                    v = value_for_month("v10", month_str)
+
+                    records.append(
+                        {
+                            "date": month_str,
+                            "2m_temperature": value_for_month("t2m", month_str),
+                            "volumetric_soil_water_layer_1": value_for_month(
+                                "swvl1", month_str
+                            ),
+                            "surface_solar_radiation_downwards": value_for_month(
+                                "ssrd", month_str
+                            ),
+                            "total_evaporation": value_for_month("e", month_str),
+                            "wind_total": (
+                                math.sqrt(u**2 + v**2)
+                                if not (np.isnan(u) or np.isnan(v))
+                                else np.nan
+                            ),
+                            "total_precipitation": value_for_month("tp", month_str),
+                            "leaf_area_index_high_vegetation": value_for_month(
+                                "lai_hv", month_str
+                            ),
+                        }
+                    )
+            finally:
+                dataset.close()
+
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    result = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+
+    if len(result) != SEQ_LEN:
+        raise RuntimeError(
+            f"Expected {SEQ_LEN} monthly rows from CDS, but received {len(result)}."
         )
 
-    ds.close()
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
+    missing_columns = [
+        name for name in FEATURE_NAMES if name not in result.columns
+    ]
+    if missing_columns:
+        raise RuntimeError(
+            "CDS response is missing required variables: "
+            + ", ".join(missing_columns)
+        )
 
-    return pd.DataFrame(records)
+    missing_values = result[FEATURE_NAMES].isna()
+    if missing_values.any().any():
+        affected = []
+        for column in FEATURE_NAMES:
+            bad_dates = result.loc[missing_values[column], "date"].tolist()
+            if bad_dates:
+                affected.append(f"{column}: {', '.join(bad_dates)}")
+        raise RuntimeError(
+            "CDS returned incomplete meteorological data. " + "; ".join(affected)
+        )
+
+    return result
 
 
 def run_lstm(model, scaler, df: pd.DataFrame) -> float:
@@ -678,8 +771,8 @@ for key, value in state_defaults.items():
 
 sel_lat, sel_lon = st.session_state["selected_center"]
 
-# (Option C) compute latest end date by probing CDS (cached)
-latest_end_dt = latest_era5_available_date()
+# Use a local date heuristic so the page never contacts CDS during startup.
+latest_end_dt = heuristic_latest_era5_date()
 latest_end = latest_end_dt.date()
 
 
@@ -706,8 +799,9 @@ with st.sidebar:
         value=latest_end,
         max_value=latest_end,
         help=(
-            "This maximum is detected by probing CDS for the latest available "
-            "ERA5-Land monthly means month."
+            "The app uses the last complete calendar month as the maximum. "
+            "ERA5-Land can occasionally be published later; choose an earlier "
+            "month if CDS reports that data is not available yet."
         ),
     )
     st.caption(f"This fetches the last {SEQ_LEN} monthly time steps.")
