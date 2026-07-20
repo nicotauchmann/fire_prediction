@@ -280,15 +280,23 @@ def _probe_era5_month_available(client: cdsapi.Client, year: str, month: str) ->
     area = [1.0, 1.0, 0.0, 0.0]  # N, W, S, E
 
     req = {
-        "product_type": "monthly_averaged_reanalysis",
+        "product_type": ["monthly_averaged_reanalysis"],    
         "variable": ["2m_temperature"],
         "year": [year],
         "month": [month],
-        "time": "00:00",
+        "time": ["00:00"],
         "area": area,
-        "format": "netcdf",
+        "data_format": "netcdf",
+        "download_format": "unarchived",
     }
 
+
+
+
+
+
+
+    
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
