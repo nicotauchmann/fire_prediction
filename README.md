@@ -9,7 +9,7 @@ The model was trained on satellite pictures and historical weather data of locat
 You can find the relevant information on forest fires here: https://www.donneesquebec.ca/recherche/dataset/feux-de-foret/resource/1edec7b1-c593-45f2-9cb1-20752633b1a0
 
 
-## Link to streamlit.io:
+## Link to the app on streamlit.io:
 https://firepredictionapp.streamlit.app/
 
 
