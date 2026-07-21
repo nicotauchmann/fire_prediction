@@ -8,11 +8,14 @@ This Streamlit app combines two wildfire prediction approaches for locations in 
 The model was trained on satellite pictures and historical weather data of locations in the Quebec province of Canada. Due to limitations regarding data availability, the meteorological data and satellite images might not be current.
 You can find the relevant information on forest fires here: https://www.donneesquebec.ca/recherche/dataset/feux-de-foret/resource/1edec7b1-c593-45f2-9cb1-20752633b1a0
 
+
 ## Link to streamlit.io:
 https://firepredictionapp.streamlit.app/
 
+
 ## Screenshot of the interface
 <img width="1051" height="1029" alt="image" src="https://github.com/nicotauchmann/fire_prediction/blob/916b541d1a7edfb94376022d2b5117830455c163/Screenshot.jpg" />
+
 
 ## Features
 
