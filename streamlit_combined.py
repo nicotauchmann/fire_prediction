@@ -352,41 +352,483 @@ def retrieve_cds_with_retry(
     raise RuntimeError(f"CDS request failed after {attempts} attempts: {last_error}")
 
 
-def open_cds_download(download_path: str, extract_dir: str) -> xr.Dataset:
-    """Open a CDS NetCDF download, including the ZIP response fallback."""
-    if zipfile.is_zipfile(download_path):
-        os.makedirs(extract_dir, exist_ok=True)
-        with zipfile.ZipFile(download_path, "r") as archive:
-            archive.extractall(extract_dir)
+def _collect_netcdf_paths(
+    download_path: str,
+    extract_dir: str,
+) -> list[Path]:
+    """
+    Return all NetCDF files contained in a CDS download.
 
-        candidates = sorted(Path(extract_dir).rglob("*.nc")) + sorted(
-            Path(extract_dir).rglob("*.netcdf")
+    CDS may return a ZIP containing multiple NetCDF files, for example
+    separate files for instantaneous and accumulated variables.
+    """
+    source = Path(download_path)
+
+    if zipfile.is_zipfile(source):
+        extract_path = Path(extract_dir)
+        extract_path.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(source, "r") as archive:
+            archive.extractall(extract_path)
+
+        candidates = sorted(extract_path.rglob("*.nc"))
+        candidates.extend(
+            sorted(extract_path.rglob("*.netcdf"))
         )
-        if not candidates:
-            raise RuntimeError("ZIP from CDS contained no NetCDF file.")
     else:
-        candidates = [Path(download_path)]
+        candidates = [source]
 
-    datasets = []
+    candidates = [
+        path for path in candidates
+        if path.is_file()
+    ]
+
+    if not candidates:
+        raise RuntimeError(
+            "The CDS download contained no readable NetCDF file."
+        )
+
+    return candidates
+
+
+def load_cds_datasets(
+    download_path: str,
+    extract_dir: str,
+) -> list[xr.Dataset]:
+    """
+    Load every NetCDF file returned by CDS as a separate dataset.
+
+    Files are deliberately not merged because converter outputs can use
+    different variable names, dimensions, or time coordinates.
+    """
+    datasets: list[xr.Dataset] = []
+
+    for candidate in _collect_netcdf_paths(
+        download_path,
+        extract_dir,
+    ):
+        opened = None
+        last_error = None
+        loaded_successfully = False
+
+        # Prefer netcdf4, but fall back to xarray's automatic engine.
+        for engine in ("netcdf4", None):
+            try:
+                if engine is None:
+                    opened = xr.open_dataset(candidate)
+                else:
+                    opened = xr.open_dataset(
+                        candidate,
+                        engine=engine,
+                    )
+
+                loaded = opened.load()
+                datasets.append(loaded)
+                loaded_successfully = True
+                break
+
+            except Exception as exc:
+                last_error = exc
+
+            finally:
+                if opened is not None:
+                    opened.close()
+                    opened = None
+
+        if not loaded_successfully:
+            raise RuntimeError(
+                f"Could not open CDS NetCDF file "
+                f"'{candidate.name}': {last_error}"
+            ) from last_error
+
+    if not datasets:
+        raise RuntimeError(
+            "CDS returned NetCDF files, but none could be opened."
+        )
+
+    return datasets
+
+
+def _first_existing_name(
+    names,
+    candidates: tuple[str, ...],
+) -> str | None:
+    """Find a candidate name exactly or case-insensitively."""
+    names = list(names)
+
+    for candidate in candidates:
+        if candidate in names:
+            return candidate
+
+    lower_lookup = {
+        str(name).lower(): str(name)
+        for name in names
+    }
+
+    for candidate in candidates:
+        match = lower_lookup.get(candidate.lower())
+
+        if match is not None:
+            return match
+
+    return None
+
+
+def _month_key(value) -> str | None:
+    """Convert an xarray, NumPy, or CDS time value to YYYY-MM."""
+    text = str(value).strip()
+
+    # Handle compact dates such as 20250701 before pandas treats the
+    # integer as nanoseconds after 1970.
+    compact = text.split(".")[0]
+
+    if (
+        compact.isdigit()
+        and len(compact) in (6, 8, 10, 12, 14)
+    ):
+        year = compact[:4]
+        month = compact[4:6]
+
+        if 1 <= int(month) <= 12:
+            return f"{year}-{month}"
+
     try:
-        for candidate in candidates:
-            datasets.append(xr.open_dataset(candidate, engine="netcdf4"))
+        timestamp = pd.to_datetime(value)
 
-        if len(datasets) == 1:
-            # Load before returning so the temporary file can safely be deleted.
-            result = datasets[0].load()
+        if not pd.isna(timestamp):
+            return timestamp.strftime("%Y-%m")
+
+    except Exception:
+        pass
+
+    # Handle ISO-like strings and cftime representations.
+    import re
+
+    match = re.search(
+        r"(?<!\d)(\d{4})[-/]?(\d{2})(?!\d)",
+        text,
+    )
+
+    if match:
+        year, month = match.groups()
+
+        if 1 <= int(month) <= 12:
+            return f"{year}-{month}"
+
+    return None
+
+
+def _normalise_longitude_for_dataset(
+    lon: float,
+    values,
+) -> float:
+    """
+    Convert a -180..180 longitude to 0..360 when the dataset uses
+    that longitude convention.
+    """
+    try:
+        longitude_values = np.asarray(
+            values,
+            dtype=float,
+        )
+
+        longitude_values = longitude_values[
+            np.isfinite(longitude_values)
+        ]
+
+        if longitude_values.size == 0:
+            return float(lon)
+
+        minimum = float(longitude_values.min())
+        maximum = float(longitude_values.max())
+
+        if (
+            minimum >= 0.0
+            and maximum > 180.0
+            and lon < 0.0
+        ):
+            return float(lon + 360.0)
+
+        if minimum < 0.0 and lon > 180.0:
+            return float(lon - 360.0)
+
+    except Exception:
+        pass
+
+    return float(lon)
+
+
+def _select_nearest_point(
+    data_array: xr.DataArray,
+    dataset: xr.Dataset,
+    lat: float,
+    lon: float,
+) -> xr.DataArray:
+    """Select the nearest available latitude and longitude point."""
+    latitude_name = _first_existing_name(
+        list(data_array.coords)
+        + list(dataset.coords),
+        (
+            "latitude",
+            "lat",
+        ),
+    )
+
+    longitude_name = _first_existing_name(
+        list(data_array.coords)
+        + list(dataset.coords),
+        (
+            "longitude",
+            "lon",
+        ),
+    )
+
+    result = data_array
+
+    if (
+        latitude_name is not None
+        and latitude_name in result.coords
+    ):
+        result = result.sel(
+            {latitude_name: float(lat)},
+            method="nearest",
+        )
+
+    if (
+        longitude_name is not None
+        and longitude_name in result.coords
+    ):
+        target_lon = _normalise_longitude_for_dataset(
+            float(lon),
+            result[longitude_name].values,
+        )
+
+        result = result.sel(
+            {longitude_name: target_lon},
+            method="nearest",
+        )
+
+    return result
+
+
+def _scalar_from_data_array(
+    data_array: xr.DataArray,
+) -> float:
+    """
+    Return a finite scalar from a selected monthly field.
+
+    Extra dimensions such as expver or number are tolerated. If several
+    finite values remain, their mean is used.
+    """
+    try:
+        values = np.asarray(
+            data_array.values,
+            dtype=float,
+        ).reshape(-1)
+
+    except Exception:
+        return np.nan
+
+    finite = values[np.isfinite(values)]
+
+    if finite.size == 0:
+        return np.nan
+
+    return float(finite.mean())
+
+
+def _extract_monthly_series(
+    datasets: list[xr.Dataset],
+    variable_aliases: tuple[str, ...],
+    lat: float,
+    lon: float,
+) -> dict[str, float]:
+    """
+    Extract a YYYY-MM -> value mapping from any returned CDS file.
+
+    Supports both traditional ERA5 short names and newer descriptive
+    variable names.
+    """
+    values_by_month: dict[str, float] = {}
+
+    for dataset in datasets:
+        variable_name = _first_existing_name(
+            dataset.data_vars,
+            variable_aliases,
+        )
+
+        if variable_name is None:
+            continue
+
+        data_array = _select_nearest_point(
+            dataset[variable_name],
+            dataset,
+            lat,
+            lon,
+        )
+
+        time_name = _first_existing_name(
+            list(data_array.coords)
+            + list(data_array.dims),
+            (
+                "valid_time",
+                "time",
+                "date",
+                "forecast_reference_time",
+            ),
+        )
+
+        if time_name is None:
+            # Some one-month files expose time as a scalar dataset
+            # coordinate rather than a dimension.
+            scalar_month = None
+
+            for candidate in (
+                "valid_time",
+                "time",
+                "date",
+                "forecast_reference_time",
+            ):
+                if candidate not in dataset.coords:
+                    continue
+
+                coordinate_values = np.asarray(
+                    dataset[candidate].values
+                ).reshape(-1)
+
+                if coordinate_values.size:
+                    scalar_month = _month_key(
+                        coordinate_values[0]
+                    )
+                    break
+
+            if scalar_month is not None:
+                value = _scalar_from_data_array(
+                    data_array
+                )
+
+                if np.isfinite(value):
+                    values_by_month.setdefault(
+                        scalar_month,
+                        value,
+                    )
+
+            continue
+
+        if time_name in data_array.coords:
+            time_coordinate = data_array[time_name]
+
+        elif time_name in dataset.coords:
+            time_coordinate = dataset[time_name]
+
         else:
-            # Some CDS responses contain one NetCDF file per variable.
-            result = xr.merge(
-                [dataset.load() for dataset in datasets],
-                compat="override",
-                join="outer",
+            continue
+
+        time_values = np.asarray(
+            time_coordinate.values
+        ).reshape(-1)
+
+        if time_name in data_array.dims:
+            time_dimension = time_name
+
+        elif time_coordinate.dims:
+            matching_dimensions = [
+                dimension
+                for dimension in time_coordinate.dims
+                if dimension in data_array.dims
+            ]
+
+            time_dimension = (
+                matching_dimensions[0]
+                if matching_dimensions
+                else None
             )
 
-        return result
-    finally:
-        for dataset in datasets:
-            dataset.close()
+        else:
+            time_dimension = None
+
+        if time_dimension is None:
+            if time_values.size == 1:
+                month = _month_key(
+                    time_values[0]
+                )
+
+                value = _scalar_from_data_array(
+                    data_array
+                )
+
+                if (
+                    month is not None
+                    and np.isfinite(value)
+                ):
+                    values_by_month.setdefault(
+                        month,
+                        value,
+                    )
+
+            continue
+
+        count = min(
+            data_array.sizes[time_dimension],
+            time_values.size,
+        )
+
+        for index in range(count):
+            month = _month_key(
+                time_values[index]
+            )
+
+            if month is None:
+                continue
+
+            monthly_slice = data_array.isel(
+                {time_dimension: index}
+            )
+
+            value = _scalar_from_data_array(
+                monthly_slice
+            )
+
+            if np.isfinite(value):
+                values_by_month.setdefault(
+                    month,
+                    value,
+                )
+
+    return values_by_month
+
+
+def _dataset_diagnostics(
+    datasets: list[xr.Dataset],
+) -> str:
+    """Build diagnostics for future CDS format changes."""
+    details = []
+
+    for index, dataset in enumerate(
+        datasets,
+        start=1,
+    ):
+        variables = ", ".join(
+            map(str, dataset.data_vars)
+        )
+
+        coordinates = ", ".join(
+            map(str, dataset.coords)
+        )
+
+        dimensions = ", ".join(
+            f"{name}={size}"
+            for name, size in dataset.sizes.items()
+        )
+
+        details.append(
+            f"file {index}: "
+            f"variables=[{variables}], "
+            f"coordinates=[{coordinates}], "
+            f"dimensions=[{dimensions}]"
+        )
+
+    return " | ".join(details)
 
 
 # ============================================================
@@ -499,168 +941,380 @@ def load_scaler_cached():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_era5_sequence(lat: float, lon: float, end_date_str: str) -> pd.DataFrame:
+def fetch_era5_sequence(
+    lat: float,
+    lon: float,
+    end_date_str: str,
+) -> pd.DataFrame:
     """
     Download exactly SEQ_LEN monthly ERA5-Land observations for one point.
 
-    Requests are split by calendar year. This avoids the CDS year/month
-    cross-product, reduces request size, and makes retries more reliable.
+    Requests are split by calendar year. Every NetCDF returned by CDS is
+    parsed independently because variable groups may be delivered in
+    separate files.
     """
-    end = datetime.strptime(end_date_str, "%Y-%m-%d")
+    end = datetime.strptime(
+        end_date_str,
+        "%Y-%m-%d",
+    )
+
     latest = heuristic_latest_era5_date()
+
     if end > latest:
         end = latest
 
-    months_list = []
+    months_list: list[datetime] = []
     current_month = end.replace(day=1)
+
     for _ in range(SEQ_LEN):
         months_list.append(current_month)
+
         if current_month.month == 1:
             current_month = current_month.replace(
                 year=current_month.year - 1,
                 month=12,
             )
         else:
-            current_month = current_month.replace(month=current_month.month - 1)
+            current_month = current_month.replace(
+                month=current_month.month - 1,
+            )
+
     months_list = sorted(months_list)
 
     months_by_year: dict[str, list[str]] = {}
     dates_by_year: dict[str, list[datetime]] = {}
+
     for month_date in months_list:
         year = str(month_date.year)
         month = f"{month_date.month:02d}"
-        months_by_year.setdefault(year, []).append(month)
-        dates_by_year.setdefault(year, []).append(month_date)
+
+        months_by_year.setdefault(
+            year,
+            [],
+        ).append(month)
+
+        dates_by_year.setdefault(
+            year,
+            [],
+        ).append(month_date)
 
     area = [
-        round(lat + 0.5, 2),
-        round(lon - 0.5, 2),
-        round(lat - 0.5, 2),
-        round(lon + 0.5, 2),
+        round(lat + 0.5, 2),  # north
+        round(lon - 0.5, 2),  # west
+        round(lat - 0.5, 2),  # south
+        round(lon + 0.5, 2),  # east
     ]
 
-    temp_root = tempfile.mkdtemp(prefix="era5_land_")
-    records = []
+    variable_aliases = {
+        "2m_temperature": (
+            "t2m",
+            "2m_temperature",
+            "temperature_2m",
+            "2t",
+        ),
+        "volumetric_soil_water_layer_1": (
+            "swvl1",
+            "volumetric_soil_water_layer_1",
+        ),
+        "surface_solar_radiation_downwards": (
+            "ssrd",
+            "surface_solar_radiation_downwards",
+        ),
+        "total_evaporation": (
+            "e",
+            "total_evaporation",
+        ),
+        "10m_u_component_of_wind": (
+            "u10",
+            "10m_u_component_of_wind",
+            "u_component_of_wind_10m",
+            "10u",
+        ),
+        "10m_v_component_of_wind": (
+            "v10",
+            "10m_v_component_of_wind",
+            "v_component_of_wind_10m",
+            "10v",
+        ),
+        "total_precipitation": (
+            "tp",
+            "total_precipitation",
+        ),
+        "leaf_area_index_high_vegetation": (
+            "lai_hv",
+            "leaf_area_index_high_vegetation",
+            "high_vegetation_leaf_area_index",
+        ),
+    }
+
+    records_by_month = {
+        month_date.strftime("%Y-%m"): {
+            "date": month_date.strftime("%Y-%m"),
+            **{
+                feature: np.nan
+                for feature in FEATURE_NAMES
+            },
+        }
+        for month_date in months_list
+    }
+
+    diagnostics: list[str] = []
+    temp_root = tempfile.mkdtemp(
+        prefix="era5_land_"
+    )
 
     try:
         for year in sorted(months_by_year):
-            target_path = os.path.join(temp_root, f"era5_{year}.download")
-            extract_dir = os.path.join(temp_root, f"era5_{year}_extracted")
+            target_path = os.path.join(
+                temp_root,
+                f"era5_{year}.zip",
+            )
+
+            extract_dir = os.path.join(
+                temp_root,
+                f"era5_{year}_extracted",
+            )
 
             request = {
-                "product_type": ["monthly_averaged_reanalysis"],
+                "product_type": [
+                    "monthly_averaged_reanalysis"
+                ],
                 "variable": ERA5_VARIABLES,
                 "year": [year],
-                "month": sorted(months_by_year[year]),
+                "month": sorted(
+                    months_by_year[year]
+                ),
                 "time": ["00:00"],
                 "area": area,
                 "data_format": "netcdf",
-                "download_format": "unarchived",
+                "download_format": "zip",
             }
 
             retrieve_cds_with_retry(
-                dataset="reanalysis-era5-land-monthly-means",
+                dataset=(
+                    "reanalysis-era5-land-"
+                    "monthly-means"
+                ),
                 request=request,
                 target_path=target_path,
                 attempts=3,
             )
 
-            dataset = open_cds_download(target_path, extract_dir)
-            try:
-                point_dataset = dataset.sel(
-                    latitude=lat,
-                    longitude=lon,
-                    method="nearest",
+            datasets = load_cds_datasets(
+                target_path,
+                extract_dir,
+            )
+
+            diagnostics.append(
+                f"{year}: "
+                f"{_dataset_diagnostics(datasets)}"
+            )
+
+            temperature = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "2m_temperature"
+                ],
+                lat,
+                lon,
+            )
+
+            soil_water = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "volumetric_soil_water_layer_1"
+                ],
+                lat,
+                lon,
+            )
+
+            solar_radiation = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "surface_solar_radiation_downwards"
+                ],
+                lat,
+                lon,
+            )
+
+            evaporation = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "total_evaporation"
+                ],
+                lat,
+                lon,
+            )
+
+            u_wind = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "10m_u_component_of_wind"
+                ],
+                lat,
+                lon,
+            )
+
+            v_wind = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "10m_v_component_of_wind"
+                ],
+                lat,
+                lon,
+            )
+
+            precipitation = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "total_precipitation"
+                ],
+                lat,
+                lon,
+            )
+
+            leaf_area = _extract_monthly_series(
+                datasets,
+                variable_aliases[
+                    "leaf_area_index_high_vegetation"
+                ],
+                lat,
+                lon,
+            )
+
+            for month_date in dates_by_year[year]:
+                month = month_date.strftime(
+                    "%Y-%m"
                 )
 
-                if "valid_time" in point_dataset.coords:
-                    time_coord = "valid_time"
-                elif "time" in point_dataset.coords:
-                    time_coord = "time"
-                else:
-                    raise RuntimeError(
-                        "CDS NetCDF has neither a 'valid_time' nor a 'time' coordinate."
+                record = records_by_month[month]
+
+                record[
+                    "2m_temperature"
+                ] = temperature.get(
+                    month,
+                    np.nan,
+                )
+
+                record[
+                    "volumetric_soil_water_layer_1"
+                ] = soil_water.get(
+                    month,
+                    np.nan,
+                )
+
+                record[
+                    "surface_solar_radiation_downwards"
+                ] = solar_radiation.get(
+                    month,
+                    np.nan,
+                )
+
+                record[
+                    "total_evaporation"
+                ] = evaporation.get(
+                    month,
+                    np.nan,
+                )
+
+                record[
+                    "total_precipitation"
+                ] = precipitation.get(
+                    month,
+                    np.nan,
+                )
+
+                record[
+                    "leaf_area_index_high_vegetation"
+                ] = leaf_area.get(
+                    month,
+                    np.nan,
+                )
+
+                u_value = u_wind.get(
+                    month,
+                    np.nan,
+                )
+
+                v_value = v_wind.get(
+                    month,
+                    np.nan,
+                )
+
+                if (
+                    np.isfinite(u_value)
+                    and np.isfinite(v_value)
+                ):
+                    record[
+                        "wind_total"
+                    ] = math.hypot(
+                        u_value,
+                        v_value,
                     )
-
-                times = point_dataset[time_coord].values
-                month_indices = {
-                    str(value)[:7]: index for index, value in enumerate(times)
-                }
-
-                def value_for_month(var_name: str, month_str: str) -> float:
-                    if var_name not in point_dataset:
-                        return np.nan
-
-                    index = month_indices.get(month_str)
-                    if index is None:
-                        return np.nan
-
-                    try:
-                        value = point_dataset[var_name].isel(
-                            {time_coord: index}
-                        ).values
-                        return float(np.asarray(value).squeeze())
-                    except Exception:
-                        return np.nan
-
-                for month_date in dates_by_year[year]:
-                    month_str = month_date.strftime("%Y-%m")
-                    u = value_for_month("u10", month_str)
-                    v = value_for_month("v10", month_str)
-
-                    records.append(
-                        {
-                            "date": month_str,
-                            "2m_temperature": value_for_month("t2m", month_str),
-                            "volumetric_soil_water_layer_1": value_for_month(
-                                "swvl1", month_str
-                            ),
-                            "surface_solar_radiation_downwards": value_for_month(
-                                "ssrd", month_str
-                            ),
-                            "total_evaporation": value_for_month("e", month_str),
-                            "wind_total": (
-                                math.sqrt(u**2 + v**2)
-                                if not (np.isnan(u) or np.isnan(v))
-                                else np.nan
-                            ),
-                            "total_precipitation": value_for_month("tp", month_str),
-                            "leaf_area_index_high_vegetation": value_for_month(
-                                "lai_hv", month_str
-                            ),
-                        }
-                    )
-            finally:
-                dataset.close()
 
     finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
+        shutil.rmtree(
+            temp_root,
+            ignore_errors=True,
+        )
 
-    result = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+    result = (
+        pd.DataFrame(
+            records_by_month.values()
+        )
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
     if len(result) != SEQ_LEN:
         raise RuntimeError(
-            f"Expected {SEQ_LEN} monthly rows from CDS, but received {len(result)}."
+            f"Expected {SEQ_LEN} monthly rows "
+            f"from CDS, but received "
+            f"{len(result)}."
         )
 
     missing_columns = [
-        name for name in FEATURE_NAMES if name not in result.columns
+        name
+        for name in FEATURE_NAMES
+        if name not in result.columns
     ]
+
     if missing_columns:
         raise RuntimeError(
-            "CDS response is missing required variables: "
+            "CDS response is missing required "
+            "variables: "
             + ", ".join(missing_columns)
         )
 
-    missing_values = result[FEATURE_NAMES].isna()
+    missing_values = result[
+        FEATURE_NAMES
+    ].isna()
+
     if missing_values.any().any():
         affected = []
+
         for column in FEATURE_NAMES:
-            bad_dates = result.loc[missing_values[column], "date"].tolist()
+            bad_dates = result.loc[
+                missing_values[column],
+                "date",
+            ].tolist()
+
             if bad_dates:
-                affected.append(f"{column}: {', '.join(bad_dates)}")
+                affected.append(
+                    f"{column}: "
+                    + ", ".join(bad_dates)
+                )
+
+        diagnostic_text = " || ".join(
+            diagnostics
+        )
+
         raise RuntimeError(
-            "CDS returned incomplete meteorological data. " + "; ".join(affected)
+            "CDS returned incomplete "
+            "meteorological data. "
+            + "; ".join(affected)
+            + ". NetCDF diagnostics: "
+            + diagnostic_text
         )
 
     return result
