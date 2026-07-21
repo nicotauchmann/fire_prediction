@@ -1,7 +1,6 @@
 # Wildfire Prediction App
 
-## Link to the app on streamlit.io:
-https://firepredictionapp.streamlit.app/
+Link to the app on streamlit.io: https://firepredictionapp.streamlit.app/
 
 
 ## Description:
