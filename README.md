@@ -3,6 +3,8 @@
 ## Link to the app on streamlit.io:
 https://firepredictionapp.streamlit.app/
 
+
+## Description:
 This Streamlit app combines two wildfire prediction approaches for locations in Québec:
 
 - **Computer vision model (VGG16):** downloads satellite image tiles around a selected point and predicts infrastructural wildfire likelihood from imagery. This produces an estimate of how likely a fire is to occur at a given location based on its physical and infrastructural characteristics.
