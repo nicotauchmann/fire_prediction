@@ -108,11 +108,16 @@ def end_of_month(d: datetime) -> datetime:
 def heuristic_latest_era5_date() -> datetime:
     """
     Safe fallback: assume last complete month is available.
-    (Much better than 'today', avoids most CDS 'not available' errors.)
+    This avoids contacting CDS during page startup.
     """
-    now = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.utcnow().replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     first_this_month = now.replace(day=1)
-    return first_this_month - timedelta(days=1)  # last day of previous month
+    return first_this_month - timedelta(days=1)
 
 
 def h3_polygon_coords(cell: str):
@@ -122,8 +127,9 @@ def h3_polygon_coords(cell: str):
 
 def point_in_polygon(lat: float, lon: float, polygon):
     """
-    Ray-casting point in polygon.
-    polygon: list of (lat, lon)
+    Ray-casting point-in-polygon test.
+
+    polygon is a list of latitude/longitude pairs.
     """
     x = lon
     y = lat
@@ -135,8 +141,13 @@ def point_in_polygon(lat: float, lon: float, polygon):
         y2, x2 = polygon[(i + 1) % n]
 
         intersects = ((y1 > y) != (y2 > y)) and (
-            x < (x2 - x1) * (y - y1) / ((y2 - y1) + 1e-12) + x1
+            x
+            < (x2 - x1)
+            * (y - y1)
+            / ((y2 - y1) + 1e-12)
+            + x1
         )
+
         if intersects:
             inside = not inside
 
@@ -144,74 +155,148 @@ def point_in_polygon(lat: float, lon: float, polygon):
 
 
 @st.cache_data(show_spinner=False)
-def cv_points_for_h3_cell(cell: str, spacing_km: float = SPACING_KM):
+def cv_points_for_h3_cell(
+    cell: str,
+    spacing_km: float = SPACING_KM,
+):
     """
-    Generate extraction points spaced ~3 km apart, anchored on the H3 cell center,
-    clipped to the selected H3 cell polygon.
+    Generate extraction points spaced approximately three kilometres apart.
+
+    The point grid is anchored on the H3-cell centre and clipped to the
+    selected H3 polygon.
     """
     center_lat, center_lon = h3.cell_to_latlng(cell)
     center_lat = float(center_lat)
     center_lon = float(center_lon)
 
     polygon = h3_polygon_coords(cell)
-    poly_lats = [p[0] for p in polygon]
-    poly_lons = [p[1] for p in polygon]
+    poly_lats = [point[0] for point in polygon]
+    poly_lons = [point[1] for point in polygon]
 
     dlat = spacing_km / 110.574
-    dlon = spacing_km / (111.320 * math.cos(math.radians(center_lat)))
+    dlon = spacing_km / (
+        111.320 * math.cos(math.radians(center_lat))
+    )
 
-    lat_span = max(abs(max(poly_lats) - center_lat), abs(center_lat - min(poly_lats)))
-    lon_span = max(abs(max(poly_lons) - center_lon), abs(center_lon - min(poly_lons)))
+    lat_span = max(
+        abs(max(poly_lats) - center_lat),
+        abs(center_lat - min(poly_lats)),
+    )
 
-    n_lat = max(1, int(math.ceil(lat_span / dlat)) + 1)
-    n_lon = max(1, int(math.ceil(lon_span / dlon)) + 1)
+    lon_span = max(
+        abs(max(poly_lons) - center_lon),
+        abs(center_lon - min(poly_lons)),
+    )
+
+    n_lat = max(
+        1,
+        int(math.ceil(lat_span / dlat)) + 1,
+    )
+
+    n_lon = max(
+        1,
+        int(math.ceil(lon_span / dlon)) + 1,
+    )
 
     raw_points = []
+
     for i in range(-n_lat, n_lat + 1):
         for j in range(-n_lon, n_lon + 1):
-            la = center_lat + i * dlat
-            lo = center_lon + j * dlon
-            if point_in_polygon(la, lo, polygon):
-                raw_points.append((i, j, la, lo))
+            point_lat = center_lat + i * dlat
+            point_lon = center_lon + j * dlon
 
-    # ensure the H3 cell centre is always included
-    if not any(i == 0 and j == 0 for i, j, _, _ in raw_points):
-        raw_points.append((0, 0, center_lat, center_lon))
+            if point_in_polygon(
+                point_lat,
+                point_lon,
+                polygon,
+            ):
+                raw_points.append(
+                    (
+                        i,
+                        j,
+                        point_lat,
+                        point_lon,
+                    )
+                )
+
+    # Ensure that the H3 centre is always included.
+    if not any(
+        i == 0 and j == 0
+        for i, j, _, _ in raw_points
+    ):
+        raw_points.append(
+            (
+                0,
+                0,
+                center_lat,
+                center_lon,
+            )
+        )
 
     raw_points.sort(
-        key=lambda t: (
-            t[0] ** 2 + t[1] ** 2,
-            abs(t[0]),
-            abs(t[1]),
-            t[0],
-            t[1],
+        key=lambda item: (
+            item[0] ** 2 + item[1] ** 2,
+            abs(item[0]),
+            abs(item[1]),
+            item[0],
+            item[1],
         )
     )
 
     points = []
     counter = 1
-    for i, j, la, lo in raw_points:
+
+    for i, j, point_lat, point_lon in raw_points:
         if i == 0 and j == 0:
             name = "center"
         else:
             name = f"p{counter:02d}"
             counter += 1
-        points.append((name, round(la, 6), round(lo, 6)))
+
+        points.append(
+            (
+                name,
+                round(point_lat, 6),
+                round(point_lon, 6),
+            )
+        )
 
     return points
 
 
 @st.cache_data(show_spinner=False)
 def build_legend_data_uri():
-    w, h = 270, 190
-    img = Image.new("RGBA", (w, h), (255, 255, 255, 235))
-    draw = ImageDraw.Draw(img)
+    width = 270
+    height = 190
 
-    draw.rectangle((0, 0, w - 1, h - 1), outline=(190, 190, 190, 255), width=1)
+    image = Image.new(
+        "RGBA",
+        (width, height),
+        (255, 255, 255, 235),
+    )
 
-    x0 = 12
+    draw = ImageDraw.Draw(image)
+
+    draw.rectangle(
+        (
+            0,
+            0,
+            width - 1,
+            height - 1,
+        ),
+        outline=(190, 190, 190, 255),
+        width=1,
+    )
+
+    x_start = 12
     y = 10
-    draw.text((x0, y), "Legend", fill=(20, 20, 20, 255))
+
+    draw.text(
+        (x_start, y),
+        "Legend",
+        fill=(20, 20, 20, 255),
+    )
+
     y += 24
 
     items = [
@@ -227,30 +312,62 @@ def build_legend_data_uri():
 
     for color, symbol, label in items:
         if symbol is None:
-            draw.line((x0, y + 4, w - 12, y + 4), fill=(210, 210, 210, 255), width=1)
+            draw.line(
+                (
+                    x_start,
+                    y + 4,
+                    width - 12,
+                    y + 4,
+                ),
+                fill=(210, 210, 210, 255),
+                width=1,
+            )
+
             y += 14
             continue
 
-        draw.text((x0, y), symbol, fill=color)
-        draw.text((x0 + 18, y), label, fill=(50, 50, 50, 255))
+        draw.text(
+            (x_start, y),
+            symbol,
+            fill=color,
+        )
+
+        draw.text(
+            (x_start + 18, y),
+            label,
+            fill=(50, 50, 50, 255),
+        )
+
         y += 20
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+
+    encoded = base64.b64encode(
+        buffer.getvalue()
+    ).decode("ascii")
+
     return f"data:image/png;base64,{encoded}"
 
 
-def add_map_legend(map_obj):
+def add_map_legend(map_object):
     legend_uri = build_legend_data_uri()
-    FloatImage(legend_uri, bottom=3, left=74).add_to(map_obj)
+
+    FloatImage(
+        legend_uri,
+        bottom=3,
+        left=74,
+    ).add_to(map_object)
 
 
-def render_result_card(title: str, body_html: str):
+def render_result_card(
+    title: str,
+    body_html: str,
+):
     st.markdown(
         f"""
 <div class="result-card">
-  <div style="font-weight:800; font-size: 1.05rem; margin-bottom: 8px;">
+  <div style="font-weight:800; font-size:1.05rem; margin-bottom:8px;">
     {html.escape(title)}
   </div>
   {body_html}
@@ -261,7 +378,7 @@ def render_result_card(title: str, body_html: str):
 
 
 # ============================================================
-# CDS / ERA5 AVAILABILITY (Option C)
+# CDS / ERA5 CONNECTION
 # ============================================================
 def get_cds_client():
     """Create a CDS client with bounded retries and a generous timeout."""
@@ -285,9 +402,12 @@ def get_cds_client():
     )
 
 
-def _is_transient_cds_error(exc: Exception) -> bool:
-    """Return True for connection errors that are reasonable to retry."""
-    message = str(exc).lower()
+def _is_transient_cds_error(
+    exception: Exception,
+) -> bool:
+    """Identify connection errors for which retrying is reasonable."""
+    message = str(exception).lower()
+
     transient_markers = (
         "ssl",
         "unexpected_eof",
@@ -308,7 +428,11 @@ def _is_transient_cds_error(exc: Exception) -> bool:
         "http 503",
         "http 504",
     )
-    return any(marker in message for marker in transient_markers)
+
+    return any(
+        marker in message
+        for marker in transient_markers
+    )
 
 
 def retrieve_cds_with_retry(
@@ -318,8 +442,10 @@ def retrieve_cds_with_retry(
     attempts: int = 3,
 ) -> None:
     """
-    Submit and download a CDS request, recreating the client/session after
-    transient SSL or network failures.
+    Submit and download a CDS request.
+
+    A new client is created for each application-level attempt so that a
+    broken HTTP session is not reused.
     """
     last_error = None
 
@@ -329,29 +455,53 @@ def retrieve_cds_with_retry(
                 os.unlink(target_path)
 
             client = get_cds_client()
-            client.retrieve(dataset, request, target_path)
 
-            if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
-                raise RuntimeError("CDS returned an empty download.")
+            client.retrieve(
+                dataset,
+                request,
+                target_path,
+            )
+
+            if (
+                not os.path.exists(target_path)
+                or os.path.getsize(target_path) == 0
+            ):
+                raise RuntimeError(
+                    "CDS returned an empty download."
+                )
 
             return
 
-        except Exception as exc:
-            last_error = exc
-            should_retry = _is_transient_cds_error(exc) and attempt < attempts
+        except Exception as exception:
+            last_error = exception
+
+            should_retry = (
+                _is_transient_cds_error(exception)
+                and attempt < attempts
+            )
 
             if not should_retry:
                 raise RuntimeError(
-                    f"CDS request failed on attempt {attempt}/{attempts}: {exc}"
-                ) from exc
+                    f"CDS request failed on attempt "
+                    f"{attempt}/{attempts}: {exception}"
+                ) from exception
 
-            # Short application-level backoff. cdsapi also performs bounded
-            # internal retries, while this retry recreates its HTTP session.
-            time.sleep(min(5 * (2 ** (attempt - 1)), 20))
+            delay = min(
+                5 * (2 ** (attempt - 1)),
+                20,
+            )
 
-    raise RuntimeError(f"CDS request failed after {attempts} attempts: {last_error}")
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"CDS request failed after {attempts} attempts: "
+        f"{last_error}"
+    )
 
 
+# ============================================================
+# CDS NETCDF PARSING
+# ============================================================
 def _collect_netcdf_paths(
     download_path: str,
     extract_dir: str,
@@ -359,27 +509,41 @@ def _collect_netcdf_paths(
     """
     Return all NetCDF files contained in a CDS download.
 
-    CDS may return a ZIP containing multiple NetCDF files, for example
-    separate files for instantaneous and accumulated variables.
+    The service may return either one NetCDF file or a ZIP archive containing
+    several NetCDF files.
     """
     source = Path(download_path)
 
     if zipfile.is_zipfile(source):
         extract_path = Path(extract_dir)
-        extract_path.mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(source, "r") as archive:
+        extract_path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with zipfile.ZipFile(
+            source,
+            "r",
+        ) as archive:
             archive.extractall(extract_path)
 
-        candidates = sorted(extract_path.rglob("*.nc"))
-        candidates.extend(
-            sorted(extract_path.rglob("*.netcdf"))
+        candidates = sorted(
+            extract_path.rglob("*.nc")
         )
+
+        candidates.extend(
+            sorted(
+                extract_path.rglob("*.netcdf")
+            )
+        )
+
     else:
         candidates = [source]
 
     candidates = [
-        path for path in candidates
+        path
+        for path in candidates
         if path.is_file()
     ]
 
@@ -396,23 +560,26 @@ def load_cds_datasets(
     extract_dir: str,
 ) -> list[xr.Dataset]:
     """
-    Load every NetCDF file returned by CDS as a separate dataset.
+    Load every NetCDF returned by CDS into memory.
 
-    Files are deliberately not merged because converter outputs can use
-    different variable names, dimensions, or time coordinates.
+    Datasets remain separate because different files can contain different
+    variable groups or coordinate structures.
     """
     datasets: list[xr.Dataset] = []
 
-    for candidate in _collect_netcdf_paths(
+    candidates = _collect_netcdf_paths(
         download_path,
         extract_dir,
-    ):
-        opened = None
-        last_error = None
-        loaded_successfully = False
+    )
 
-        # Prefer netcdf4, but fall back to xarray's automatic engine.
+    for candidate in candidates:
+        loaded_dataset = None
+        last_error = None
+
+        # Prefer netCDF4, but fall back to xarray's automatic engine.
         for engine in ("netcdf4", None):
+            opened = None
+
             try:
                 if engine is None:
                     opened = xr.open_dataset(candidate)
@@ -422,24 +589,23 @@ def load_cds_datasets(
                         engine=engine,
                     )
 
-                loaded = opened.load()
-                datasets.append(loaded)
-                loaded_successfully = True
+                loaded_dataset = opened.load()
                 break
 
-            except Exception as exc:
-                last_error = exc
+            except Exception as exception:
+                last_error = exception
 
             finally:
                 if opened is not None:
                     opened.close()
-                    opened = None
 
-        if not loaded_successfully:
+        if loaded_dataset is None:
             raise RuntimeError(
                 f"Could not open CDS NetCDF file "
                 f"'{candidate.name}': {last_error}"
             ) from last_error
+
+        datasets.append(loaded_dataset)
 
     if not datasets:
         raise RuntimeError(
@@ -453,20 +619,25 @@ def _first_existing_name(
     names,
     candidates: tuple[str, ...],
 ) -> str | None:
-    """Find a candidate name exactly or case-insensitively."""
-    names = list(names)
+    """Find a coordinate or variable name, ignoring letter case if needed."""
+    names = [
+        str(name)
+        for name in names
+    ]
 
     for candidate in candidates:
         if candidate in names:
             return candidate
 
     lower_lookup = {
-        str(name).lower(): str(name)
+        name.lower(): name
         for name in names
     }
 
     for candidate in candidates:
-        match = lower_lookup.get(candidate.lower())
+        match = lower_lookup.get(
+            candidate.lower()
+        )
 
         if match is not None:
             return match
@@ -475,16 +646,21 @@ def _first_existing_name(
 
 
 def _month_key(value) -> str | None:
-    """Convert an xarray, NumPy, or CDS time value to YYYY-MM."""
+    """Convert a time-coordinate value to YYYY-MM."""
     text = str(value).strip()
-
-    # Handle compact dates such as 20250701 before pandas treats the
-    # integer as nanoseconds after 1970.
     compact = text.split(".")[0]
 
+    # Handle compact values such as 20250701 before pandas interprets an
+    # integer as nanoseconds since 1970.
     if (
         compact.isdigit()
-        and len(compact) in (6, 8, 10, 12, 14)
+        and len(compact) in (
+            6,
+            8,
+            10,
+            12,
+            14,
+        )
     ):
         year = compact[:4]
         month = compact[4:6]
@@ -496,12 +672,14 @@ def _month_key(value) -> str | None:
         timestamp = pd.to_datetime(value)
 
         if not pd.isna(timestamp):
-            return timestamp.strftime("%Y-%m")
+            return timestamp.strftime(
+                "%Y-%m"
+            )
 
     except Exception:
         pass
 
-    # Handle ISO-like strings and cftime representations.
+    # Also handle ISO-like and cftime string representations.
     import re
 
     match = re.search(
@@ -519,12 +697,13 @@ def _month_key(value) -> str | None:
 
 
 def _normalise_longitude_for_dataset(
-    lon: float,
+    longitude: float,
     values,
 ) -> float:
     """
-    Convert a -180..180 longitude to 0..360 when the dataset uses
-    that longitude convention.
+    Match a longitude to the coordinate convention used by a dataset.
+
+    Some datasets represent longitude as -180..180 and others as 0..360.
     """
     try:
         longitude_values = np.asarray(
@@ -537,34 +716,46 @@ def _normalise_longitude_for_dataset(
         ]
 
         if longitude_values.size == 0:
-            return float(lon)
+            return float(longitude)
 
-        minimum = float(longitude_values.min())
-        maximum = float(longitude_values.max())
+        minimum = float(
+            longitude_values.min()
+        )
+
+        maximum = float(
+            longitude_values.max()
+        )
 
         if (
             minimum >= 0.0
             and maximum > 180.0
-            and lon < 0.0
+            and longitude < 0.0
         ):
-            return float(lon + 360.0)
+            return float(
+                longitude + 360.0
+            )
 
-        if minimum < 0.0 and lon > 180.0:
-            return float(lon - 360.0)
+        if (
+            minimum < 0.0
+            and longitude > 180.0
+        ):
+            return float(
+                longitude - 360.0
+            )
 
     except Exception:
         pass
 
-    return float(lon)
+    return float(longitude)
 
 
 def _select_nearest_point(
     data_array: xr.DataArray,
     dataset: xr.Dataset,
-    lat: float,
-    lon: float,
+    latitude: float,
+    longitude: float,
 ) -> xr.DataArray:
-    """Select the nearest available latitude and longitude point."""
+    """Select the nearest available latitude and longitude grid point."""
     latitude_name = _first_existing_name(
         list(data_array.coords)
         + list(dataset.coords),
@@ -590,7 +781,11 @@ def _select_nearest_point(
         and latitude_name in result.coords
     ):
         result = result.sel(
-            {latitude_name: float(lat)},
+            {
+                latitude_name: float(
+                    latitude
+                )
+            },
             method="nearest",
         )
 
@@ -598,13 +793,21 @@ def _select_nearest_point(
         longitude_name is not None
         and longitude_name in result.coords
     ):
-        target_lon = _normalise_longitude_for_dataset(
-            float(lon),
-            result[longitude_name].values,
+        target_longitude = (
+            _normalise_longitude_for_dataset(
+                float(longitude),
+                result[
+                    longitude_name
+                ].values,
+            )
         )
 
         result = result.sel(
-            {longitude_name: target_lon},
+            {
+                longitude_name: (
+                    target_longitude
+                )
+            },
             method="nearest",
         )
 
@@ -615,7 +818,7 @@ def _scalar_from_data_array(
     data_array: xr.DataArray,
 ) -> float:
     """
-    Return a finite scalar from a selected monthly field.
+    Return one finite scalar from a selected field.
 
     Extra dimensions such as expver or number are tolerated. If several
     finite values remain, their mean is used.
@@ -629,58 +832,71 @@ def _scalar_from_data_array(
     except Exception:
         return np.nan
 
-    finite = values[np.isfinite(values)]
+    finite_values = values[
+        np.isfinite(values)
+    ]
 
-    if finite.size == 0:
+    if finite_values.size == 0:
         return np.nan
 
-    return float(finite.mean())
+    return float(
+        finite_values.mean()
+    )
 
 
 def _extract_monthly_series(
     datasets: list[xr.Dataset],
     variable_aliases: tuple[str, ...],
-    lat: float,
-    lon: float,
+    latitude: float,
+    longitude: float,
 ) -> dict[str, float]:
     """
-    Extract a YYYY-MM -> value mapping from any returned CDS file.
+    Extract a dictionary mapping YYYY-MM to values.
 
-    Supports both traditional ERA5 short names and newer descriptive
-    variable names.
+    This supports both short ERA5 variable names such as t2m and descriptive
+    names such as 2m_temperature.
     """
-    values_by_month: dict[str, float] = {}
+    values_by_month: dict[
+        str,
+        float,
+    ] = {}
 
     for dataset in datasets:
-        variable_name = _first_existing_name(
-            dataset.data_vars,
-            variable_aliases,
+        variable_name = (
+            _first_existing_name(
+                dataset.data_vars,
+                variable_aliases,
+            )
         )
 
         if variable_name is None:
             continue
 
-        data_array = _select_nearest_point(
-            dataset[variable_name],
-            dataset,
-            lat,
-            lon,
+        data_array = (
+            _select_nearest_point(
+                dataset[variable_name],
+                dataset,
+                latitude,
+                longitude,
+            )
         )
 
-        time_name = _first_existing_name(
-            list(data_array.coords)
-            + list(data_array.dims),
-            (
-                "valid_time",
-                "time",
-                "date",
-                "forecast_reference_time",
-            ),
+        time_name = (
+            _first_existing_name(
+                list(data_array.coords)
+                + list(data_array.dims),
+                (
+                    "valid_time",
+                    "time",
+                    "date",
+                    "forecast_reference_time",
+                ),
+            )
         )
 
         if time_name is None:
-            # Some one-month files expose time as a scalar dataset
-            # coordinate rather than a dimension.
+            # A one-month file can expose its time only as a scalar dataset
+            # coordinate rather than as a dimension of the variable.
             scalar_month = None
 
             for candidate in (
@@ -693,7 +909,9 @@ def _extract_monthly_series(
                     continue
 
                 coordinate_values = np.asarray(
-                    dataset[candidate].values
+                    dataset[
+                        candidate
+                    ].values
                 ).reshape(-1)
 
                 if coordinate_values.size:
@@ -703,8 +921,10 @@ def _extract_monthly_series(
                     break
 
             if scalar_month is not None:
-                value = _scalar_from_data_array(
-                    data_array
+                value = (
+                    _scalar_from_data_array(
+                        data_array
+                    )
                 )
 
                 if np.isfinite(value):
@@ -716,10 +936,14 @@ def _extract_monthly_series(
             continue
 
         if time_name in data_array.coords:
-            time_coordinate = data_array[time_name]
+            time_coordinate = (
+                data_array[time_name]
+            )
 
         elif time_name in dataset.coords:
-            time_coordinate = dataset[time_name]
+            time_coordinate = (
+                dataset[time_name]
+            )
 
         else:
             continue
@@ -734,8 +958,10 @@ def _extract_monthly_series(
         elif time_coordinate.dims:
             matching_dimensions = [
                 dimension
-                for dimension in time_coordinate.dims
-                if dimension in data_array.dims
+                for dimension
+                in time_coordinate.dims
+                if dimension
+                in data_array.dims
             ]
 
             time_dimension = (
@@ -753,8 +979,10 @@ def _extract_monthly_series(
                     time_values[0]
                 )
 
-                value = _scalar_from_data_array(
-                    data_array
+                value = (
+                    _scalar_from_data_array(
+                        data_array
+                    )
                 )
 
                 if (
@@ -769,7 +997,9 @@ def _extract_monthly_series(
             continue
 
         count = min(
-            data_array.sizes[time_dimension],
+            data_array.sizes[
+                time_dimension
+            ],
             time_values.size,
         )
 
@@ -781,12 +1011,18 @@ def _extract_monthly_series(
             if month is None:
                 continue
 
-            monthly_slice = data_array.isel(
-                {time_dimension: index}
+            monthly_slice = (
+                data_array.isel(
+                    {
+                        time_dimension: index
+                    }
+                )
             )
 
-            value = _scalar_from_data_array(
-                monthly_slice
+            value = (
+                _scalar_from_data_array(
+                    monthly_slice
+                )
             )
 
             if np.isfinite(value):
@@ -798,10 +1034,254 @@ def _extract_monthly_series(
     return values_by_month
 
 
+def _find_nearest_valid_era5_point(
+    datasets: list[xr.Dataset],
+    target_latitude: float,
+    target_longitude: float,
+    max_distance_km: float = 50.0,
+) -> tuple[float, float, float]:
+    """
+    Find the nearest ERA5-Land cell containing valid temperature data.
+
+    ERA5-Land masks ocean cells. A selected H3 centre can therefore be located
+    on a water cell even when nearby land is visible. The same valid ERA5 cell
+    is subsequently used for every meteorological feature.
+    """
+    temperature_aliases = (
+        "t2m",
+        "2m_temperature",
+        "temperature_2m",
+        "2t",
+    )
+
+    best_candidate = None
+
+    for dataset in datasets:
+        variable_name = (
+            _first_existing_name(
+                dataset.data_vars,
+                temperature_aliases,
+            )
+        )
+
+        if variable_name is None:
+            continue
+
+        data_array = dataset[
+            variable_name
+        ]
+
+        latitude_name = (
+            _first_existing_name(
+                list(data_array.coords)
+                + list(dataset.coords),
+                (
+                    "latitude",
+                    "lat",
+                ),
+            )
+        )
+
+        longitude_name = (
+            _first_existing_name(
+                list(data_array.coords)
+                + list(dataset.coords),
+                (
+                    "longitude",
+                    "lon",
+                ),
+            )
+        )
+
+        if (
+            latitude_name is None
+            or longitude_name is None
+        ):
+            continue
+
+        if (
+            latitude_name
+            not in data_array.dims
+            or longitude_name
+            not in data_array.dims
+        ):
+            continue
+
+        non_spatial_dimensions = [
+            dimension
+            for dimension
+            in data_array.dims
+            if dimension
+            not in (
+                latitude_name,
+                longitude_name,
+            )
+        ]
+
+        valid_mask = np.isfinite(
+            data_array
+        )
+
+        if non_spatial_dimensions:
+            valid_mask = valid_mask.any(
+                dim=non_spatial_dimensions
+            )
+
+        valid_mask = valid_mask.transpose(
+            latitude_name,
+            longitude_name,
+        )
+
+        latitude_values = np.asarray(
+            valid_mask[
+                latitude_name
+            ].values,
+            dtype=float,
+        )
+
+        longitude_values = np.asarray(
+            valid_mask[
+                longitude_name
+            ].values,
+            dtype=float,
+        )
+
+        mask_values = np.asarray(
+            valid_mask.values,
+            dtype=bool,
+        )
+
+        if (
+            latitude_values.size == 0
+            or longitude_values.size == 0
+            or not mask_values.any()
+        ):
+            continue
+
+        normalised_target_longitude = (
+            _normalise_longitude_for_dataset(
+                target_longitude,
+                longitude_values,
+            )
+        )
+
+        (
+            latitude_grid,
+            longitude_grid,
+        ) = np.meshgrid(
+            latitude_values,
+            longitude_values,
+            indexing="ij",
+        )
+
+        longitude_difference = (
+            (
+                longitude_grid
+                - normalised_target_longitude
+                + 180.0
+            )
+            % 360.0
+        ) - 180.0
+
+        latitude_difference = (
+            latitude_grid
+            - float(target_latitude)
+        )
+
+        north_south_km = (
+            latitude_difference
+            * 111.32
+        )
+
+        east_west_km = (
+            longitude_difference
+            * 111.32
+            * math.cos(
+                math.radians(
+                    float(target_latitude)
+                )
+            )
+        )
+
+        distance_km = np.sqrt(
+            north_south_km**2
+            + east_west_km**2
+        )
+
+        distance_km[
+            ~mask_values
+        ] = np.inf
+
+        flat_index = int(
+            np.argmin(distance_km)
+        )
+
+        (
+            row_index,
+            column_index,
+        ) = np.unravel_index(
+            flat_index,
+            distance_km.shape,
+        )
+
+        nearest_distance = float(
+            distance_km[
+                row_index,
+                column_index,
+            ]
+        )
+
+        if not np.isfinite(
+            nearest_distance
+        ):
+            continue
+
+        candidate = (
+            float(
+                latitude_values[
+                    row_index
+                ]
+            ),
+            float(
+                longitude_values[
+                    column_index
+                ]
+            ),
+            nearest_distance,
+        )
+
+        if (
+            best_candidate is None
+            or candidate[2]
+            < best_candidate[2]
+        ):
+            best_candidate = candidate
+
+    if best_candidate is None:
+        raise RuntimeError(
+            "No valid ERA5-Land grid point was found in the downloaded "
+            "area. The selected location may be over water or outside "
+            "the ERA5-Land mask."
+        )
+
+    if (
+        best_candidate[2]
+        > max_distance_km
+    ):
+        raise RuntimeError(
+            "The selected location does not have valid ERA5-Land data, "
+            "and the nearest valid land grid point is "
+            f"{best_candidate[2]:.1f} km away. Please select a location "
+            "closer to land."
+        )
+
+    return best_candidate
+
+
 def _dataset_diagnostics(
     datasets: list[xr.Dataset],
 ) -> str:
-    """Build diagnostics for future CDS format changes."""
+    """Build concise diagnostics for future CDS format changes."""
     details = []
 
     for index, dataset in enumerate(
@@ -809,16 +1289,23 @@ def _dataset_diagnostics(
         start=1,
     ):
         variables = ", ".join(
-            map(str, dataset.data_vars)
+            map(
+                str,
+                dataset.data_vars,
+            )
         )
 
         coordinates = ", ".join(
-            map(str, dataset.coords)
+            map(
+                str,
+                dataset.coords,
+            )
         )
 
         dimensions = ", ".join(
             f"{name}={size}"
-            for name, size in dataset.sizes.items()
+            for name, size
+            in dataset.sizes.items()
         )
 
         details.append(
@@ -835,158 +1322,370 @@ def _dataset_diagnostics(
 # COMPUTER VISION HELPERS
 # ============================================================
 def get_mapbox_token() -> str:
-    token = secret_or_env("MAPBOX_ACCESS_TOKEN")
+    token = secret_or_env(
+        "MAPBOX_ACCESS_TOKEN"
+    )
+
     if not token:
         raise RuntimeError(
-            "MAPBOX_ACCESS_TOKEN is missing. Add it to Streamlit secrets or your environment."
+            "MAPBOX_ACCESS_TOKEN is missing. Add it to Streamlit "
+            "secrets or your environment."
         )
+
     return token
 
 
-def build_mapbox_url(lon: float, lat: float, token: str) -> str:
-    lon = round(float(lon), 6)
-    lat = round(float(lat), 6)
-    base = f"https://api.mapbox.com/styles/v1/{STYLE_USER}/{STYLE_ID}/static/"
-    coords = f"{lon},{lat}"
-    rest = (
-        f",{ZOOM},{BEARING}/{TILE_SIZE}x{TILE_SIZE}"
-        f"?access_token={token}&logo=false&attribution=false"
+def build_mapbox_url(
+    longitude: float,
+    latitude: float,
+    token: str,
+) -> str:
+    longitude = round(
+        float(longitude),
+        6,
     )
-    return base + coords + rest
+
+    latitude = round(
+        float(latitude),
+        6,
+    )
+
+    base = (
+        f"https://api.mapbox.com/styles/v1/"
+        f"{STYLE_USER}/{STYLE_ID}/static/"
+    )
+
+    coordinates = (
+        f"{longitude},{latitude}"
+    )
+
+    remainder = (
+        f",{ZOOM},{BEARING}/"
+        f"{TILE_SIZE}x{TILE_SIZE}"
+        f"?access_token={token}"
+        f"&logo=false"
+        f"&attribution=false"
+    )
+
+    return (
+        base
+        + coordinates
+        + remainder
+    )
 
 
-def preprocess_pil(img: Image.Image) -> np.ndarray:
-    x = np.asarray(img, dtype=np.float32) * RESCALE
-    return np.expand_dims(x, axis=0)
+def preprocess_pil(
+    image: Image.Image,
+) -> np.ndarray:
+    values = (
+        np.asarray(
+            image,
+            dtype=np.float32,
+        )
+        * RESCALE
+    )
+
+    return np.expand_dims(
+        values,
+        axis=0,
+    )
 
 
-def predict_wildfire_prob_cv(model, img: Image.Image) -> float:
-    x = preprocess_pil(img)
-    y = np.array(model.predict(x, verbose=0))
-    if y.ndim == 2 and y.shape[1] == 2:
-        return float(y[0, CV_WILDFIRE_INDEX])
-    if y.ndim == 2 and y.shape[1] == 1:
-        return float(y[0, 0])
-    raise ValueError(f"Unexpected CV model output shape: {y.shape}")
+def predict_wildfire_prob_cv(
+    model,
+    image: Image.Image,
+) -> float:
+    values = preprocess_pil(
+        image
+    )
+
+    prediction = np.array(
+        model.predict(
+            values,
+            verbose=0,
+        )
+    )
+
+    if (
+        prediction.ndim == 2
+        and prediction.shape[1] == 2
+    ):
+        return float(
+            prediction[
+                0,
+                CV_WILDFIRE_INDEX,
+            ]
+        )
+
+    if (
+        prediction.ndim == 2
+        and prediction.shape[1] == 1
+    ):
+        return float(
+            prediction[0, 0]
+        )
+
+    raise ValueError(
+        "Unexpected CV model output shape: "
+        f"{prediction.shape}"
+    )
 
 
-def compute_fire_rating(df: pd.DataFrame, threshold: float = LIKELY_THRESHOLD):
-    probs = pd.to_numeric(df.get("p_wildfire"), errors="coerce")
-    likely_count = int((probs >= threshold).sum())
+def compute_fire_rating(
+    dataframe: pd.DataFrame,
+    threshold: float = LIKELY_THRESHOLD,
+):
+    probabilities = pd.to_numeric(
+        dataframe.get(
+            "p_wildfire"
+        ),
+        errors="coerce",
+    )
 
-    if likely_count in (1, 2, 3, 4, 5, 6, 7, 8):
+    likely_count = int(
+        (
+            probabilities >= threshold
+        ).sum()
+    )
+
+    if likely_count in range(
+        1,
+        9,
+    ):
         stars = 0
-        msg = "A fire is unlikely in this environment."
-    elif likely_count in (9, 10, 11, 12, 13, 14, 15, 16, 17):
+        message = (
+            "A fire is unlikely in this environment."
+        )
+
+    elif likely_count in range(
+        9,
+        18,
+    ):
         stars = 1
-        msg = "The fire potential of this environment is low."
-    elif likely_count in (18, 19, 20, 21, 22, 23, 24, 25, 26):
+        message = (
+            "The fire potential of this environment is low."
+        )
+
+    elif likely_count in range(
+        18,
+        27,
+    ):
         stars = 2
-        msg = "The fire potential of this environment is moderate. Check local safety precautions."
+        message = (
+            "The fire potential of this environment is moderate. "
+            "Check local safety precautions."
+        )
+
     else:
         stars = 3
-        msg = "The fire potential of this environment is high. Check local safety precautions."
+        message = (
+            "The fire potential of this environment is high. "
+            "Check local safety precautions."
+        )
 
-    emoji = "🔥" * stars if stars > 0 else "—"
-    return likely_count, stars, emoji, msg
+    emoji = (
+        "🔥" * stars
+        if stars > 0
+        else "—"
+    )
+
+    return (
+        likely_count,
+        stars,
+        emoji,
+        message,
+    )
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(
+    show_spinner=False
+)
 def load_cv_model_cached():
     import tensorflow as tf
 
     if not CV_MODEL_PATH.exists():
-        raise FileNotFoundError(f"CV model file not found: {CV_MODEL_PATH.resolve()}")
-    return tf.keras.models.load_model(CV_MODEL_PATH)
+        raise FileNotFoundError(
+            "CV model file not found: "
+            f"{CV_MODEL_PATH.resolve()}"
+        )
+
+    return tf.keras.models.load_model(
+        CV_MODEL_PATH
+    )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def download_bytes(url: str) -> bytes:
-    r = SESSION.get(url, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.content
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def download_bytes(
+    url: str,
+) -> bytes:
+    response = SESSION.get(
+        url,
+        timeout=30,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    return response.content
 
 
-def fetch_tile(lon: float, lat: float, token: str) -> Image.Image:
-    url = build_mapbox_url(lon, lat, token)
-    content = download_bytes(url)
-    img = Image.open(io.BytesIO(content)).convert("RGB")
-    if img.size != (TILE_SIZE, TILE_SIZE):
-        img = img.resize((TILE_SIZE, TILE_SIZE))
-    return img
+def fetch_tile(
+    longitude: float,
+    latitude: float,
+    token: str,
+) -> Image.Image:
+    url = build_mapbox_url(
+        longitude,
+        latitude,
+        token,
+    )
+
+    content = download_bytes(
+        url
+    )
+
+    image = Image.open(
+        io.BytesIO(content)
+    ).convert("RGB")
+
+    if image.size != (
+        TILE_SIZE,
+        TILE_SIZE,
+    ):
+        image = image.resize(
+            (
+                TILE_SIZE,
+                TILE_SIZE,
+            )
+        )
+
+    return image
 
 
 # ============================================================
 # LSTM / ERA5 HELPERS
 # ============================================================
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(
+    show_spinner=False
+)
 def load_lstm_model_cached():
     import tensorflow as tf
 
     if not LSTM_MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"LSTM model file not found: {LSTM_MODEL_PATH.resolve()}"
+            "LSTM model file not found: "
+            f"{LSTM_MODEL_PATH.resolve()}"
         )
-    return tf.keras.models.load_model(LSTM_MODEL_PATH)
+
+    return tf.keras.models.load_model(
+        LSTM_MODEL_PATH
+    )
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(
+    show_spinner=False
+)
 def load_scaler_cached():
     if not SCALER_PATH.exists():
         return None
+
     import joblib
 
-    return joblib.load(SCALER_PATH)
+    return joblib.load(
+        SCALER_PATH
+    )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
 def fetch_era5_sequence(
-    lat: float,
-    lon: float,
-    end_date_str: str,
+    latitude: float,
+    longitude: float,
+    end_date_string: str,
 ) -> pd.DataFrame:
     """
-    Download exactly SEQ_LEN monthly ERA5-Land observations for one point.
+    Download exactly 12 monthly ERA5-Land observations for one location.
 
-    Requests are split by calendar year. Every NetCDF returned by CDS is
-    parsed independently because variable groups may be delivered in
-    separate files.
+    Requests are split by calendar year. Returned NetCDF files are parsed
+    separately. If the clicked grid cell is masked, the nearest valid
+    ERA5-Land cell within 50 km is used consistently for all model features.
     """
-    end = datetime.strptime(
-        end_date_str,
+    end_date = datetime.strptime(
+        end_date_string,
         "%Y-%m-%d",
     )
 
-    latest = heuristic_latest_era5_date()
+    latest_date = (
+        heuristic_latest_era5_date()
+    )
 
-    if end > latest:
-        end = latest
+    if end_date > latest_date:
+        end_date = latest_date
 
-    months_list: list[datetime] = []
-    current_month = end.replace(day=1)
+    requested_months: list[
+        datetime
+    ] = []
+
+    current_month = end_date.replace(
+        day=1
+    )
 
     for _ in range(SEQ_LEN):
-        months_list.append(current_month)
+        requested_months.append(
+            current_month
+        )
 
         if current_month.month == 1:
-            current_month = current_month.replace(
-                year=current_month.year - 1,
-                month=12,
+            current_month = (
+                current_month.replace(
+                    year=(
+                        current_month.year
+                        - 1
+                    ),
+                    month=12,
+                )
             )
+
         else:
-            current_month = current_month.replace(
-                month=current_month.month - 1,
+            current_month = (
+                current_month.replace(
+                    month=(
+                        current_month.month
+                        - 1
+                    )
+                )
             )
 
-    months_list = sorted(months_list)
+    requested_months = sorted(
+        requested_months
+    )
 
-    months_by_year: dict[str, list[str]] = {}
-    dates_by_year: dict[str, list[datetime]] = {}
+    months_by_year: dict[
+        str,
+        list[str],
+    ] = {}
 
-    for month_date in months_list:
-        year = str(month_date.year)
-        month = f"{month_date.month:02d}"
+    dates_by_year: dict[
+        str,
+        list[datetime],
+    ] = {}
+
+    for month_date in requested_months:
+        year = str(
+            month_date.year
+        )
+
+        month = (
+            f"{month_date.month:02d}"
+        )
 
         months_by_year.setdefault(
             year,
@@ -999,10 +1698,22 @@ def fetch_era5_sequence(
         ).append(month_date)
 
     area = [
-        round(lat + 0.5, 2),  # north
-        round(lon - 0.5, 2),  # west
-        round(lat - 0.5, 2),  # south
-        round(lon + 0.5, 2),  # east
+        round(
+            latitude + 0.5,
+            2,
+        ),
+        round(
+            longitude - 0.5,
+            2,
+        ),
+        round(
+            latitude - 0.5,
+            2,
+        ),
+        round(
+            longitude + 0.5,
+            2,
+        ),
     ]
 
     variable_aliases = {
@@ -1048,31 +1759,50 @@ def fetch_era5_sequence(
     }
 
     records_by_month = {
-        month_date.strftime("%Y-%m"): {
-            "date": month_date.strftime("%Y-%m"),
+        month_date.strftime(
+            "%Y-%m"
+        ): {
+            "date": month_date.strftime(
+                "%Y-%m"
+            ),
             **{
                 feature: np.nan
-                for feature in FEATURE_NAMES
+                for feature
+                in FEATURE_NAMES
             },
         }
-        for month_date in months_list
+        for month_date
+        in requested_months
     }
 
     diagnostics: list[str] = []
-    temp_root = tempfile.mkdtemp(
+
+    selected_grid_points: list[
+        tuple[
+            float,
+            float,
+            float,
+        ]
+    ] = []
+
+    temporary_root = tempfile.mkdtemp(
         prefix="era5_land_"
     )
 
     try:
-        for year in sorted(months_by_year):
+        for year in sorted(
+            months_by_year
+        ):
             target_path = os.path.join(
-                temp_root,
-                f"era5_{year}.zip",
+                temporary_root,
+                f"era5_{year}.download",
             )
 
-            extract_dir = os.path.join(
-                temp_root,
-                f"era5_{year}_extracted",
+            extract_directory = (
+                os.path.join(
+                    temporary_root,
+                    f"era5_{year}_extracted",
+                )
             )
 
             request = {
@@ -1087,7 +1817,9 @@ def fetch_era5_sequence(
                 "time": ["00:00"],
                 "area": area,
                 "data_format": "netcdf",
-                "download_format": "zip",
+                "download_format": (
+                    "unarchived"
+                ),
             }
 
             retrieve_cds_with_retry(
@@ -1102,7 +1834,7 @@ def fetch_era5_sequence(
 
             datasets = load_cds_datasets(
                 target_path,
-                extract_dir,
+                extract_directory,
             )
 
             diagnostics.append(
@@ -1110,84 +1842,140 @@ def fetch_era5_sequence(
                 f"{_dataset_diagnostics(datasets)}"
             )
 
-            temperature = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "2m_temperature"
-                ],
-                lat,
-                lon,
+            (
+                era5_latitude,
+                era5_longitude,
+                era5_distance_km,
+            ) = (
+                _find_nearest_valid_era5_point(
+                    datasets=datasets,
+                    target_latitude=latitude,
+                    target_longitude=longitude,
+                    max_distance_km=50.0,
+                )
             )
 
-            soil_water = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "volumetric_soil_water_layer_1"
-                ],
-                lat,
-                lon,
+            selected_grid_points.append(
+                (
+                    era5_latitude,
+                    era5_longitude,
+                    era5_distance_km,
+                )
             )
 
-            solar_radiation = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "surface_solar_radiation_downwards"
-                ],
-                lat,
-                lon,
+            diagnostics.append(
+                f"{year}: requested point="
+                f"({latitude:.6f}, "
+                f"{longitude:.6f}), "
+                f"ERA5 point="
+                f"({era5_latitude:.6f}, "
+                f"{era5_longitude:.6f}), "
+                f"distance="
+                f"{era5_distance_km:.1f} km"
             )
 
-            evaporation = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "total_evaporation"
-                ],
-                lat,
-                lon,
+            temperature = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "2m_temperature"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
             )
 
-            u_wind = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "10m_u_component_of_wind"
-                ],
-                lat,
-                lon,
+            soil_water = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "volumetric_soil_water_layer_1"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
             )
 
-            v_wind = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "10m_v_component_of_wind"
-                ],
-                lat,
-                lon,
+            solar_radiation = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "surface_solar_radiation_downwards"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
             )
 
-            precipitation = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "total_precipitation"
-                ],
-                lat,
-                lon,
+            evaporation = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "total_evaporation"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
             )
 
-            leaf_area = _extract_monthly_series(
-                datasets,
-                variable_aliases[
-                    "leaf_area_index_high_vegetation"
-                ],
-                lat,
-                lon,
+            u_wind = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "10m_u_component_of_wind"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
             )
 
-            for month_date in dates_by_year[year]:
-                month = month_date.strftime(
-                    "%Y-%m"
+            v_wind = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "10m_v_component_of_wind"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
+            )
+
+            precipitation = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "total_precipitation"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
+            )
+
+            leaf_area = (
+                _extract_monthly_series(
+                    datasets,
+                    variable_aliases[
+                        "leaf_area_index_high_vegetation"
+                    ],
+                    era5_latitude,
+                    era5_longitude,
+                )
+            )
+
+            for month_date in (
+                dates_by_year[year]
+            ):
+                month = (
+                    month_date.strftime(
+                        "%Y-%m"
+                    )
                 )
 
-                record = records_by_month[month]
+                record = (
+                    records_by_month[
+                        month
+                    ]
+                )
 
                 record[
                     "2m_temperature"
@@ -1254,7 +2042,7 @@ def fetch_era5_sequence(
 
     finally:
         shutil.rmtree(
-            temp_root,
+            temporary_root,
             ignore_errors=True,
         )
 
@@ -1283,7 +2071,9 @@ def fetch_era5_sequence(
         raise RuntimeError(
             "CDS response is missing required "
             "variables: "
-            + ", ".join(missing_columns)
+            + ", ".join(
+                missing_columns
+            )
         )
 
     missing_values = result[
@@ -1302,62 +2092,155 @@ def fetch_era5_sequence(
             if bad_dates:
                 affected.append(
                     f"{column}: "
-                    + ", ".join(bad_dates)
+                    + ", ".join(
+                        bad_dates
+                    )
                 )
-
-        diagnostic_text = " || ".join(
-            diagnostics
-        )
 
         raise RuntimeError(
             "CDS returned incomplete "
             "meteorological data. "
             + "; ".join(affected)
             + ". NetCDF diagnostics: "
-            + diagnostic_text
+            + " || ".join(diagnostics)
         )
+
+    if selected_grid_points:
+        result.attrs[
+            "era5_latitude"
+        ] = selected_grid_points[
+            0
+        ][0]
+
+        result.attrs[
+            "era5_longitude"
+        ] = selected_grid_points[
+            0
+        ][1]
+
+        result.attrs[
+            "era5_distance_km"
+        ] = selected_grid_points[
+            0
+        ][2]
 
     return result
 
 
-def run_lstm(model, scaler, df: pd.DataFrame) -> float:
-    x = df[FEATURE_NAMES].values.astype(np.float32)
+def run_lstm(
+    model,
+    scaler,
+    dataframe: pd.DataFrame,
+) -> float:
+    values = dataframe[
+        FEATURE_NAMES
+    ].values.astype(
+        np.float32
+    )
 
     if scaler is not None:
-        flat = x.reshape(-1, N_FEATURES)
-        flat = scaler.transform(flat)
-        x = flat.reshape(SEQ_LEN, N_FEATURES)
+        flattened = values.reshape(
+            -1,
+            N_FEATURES,
+        )
 
-    x = np.expand_dims(x, axis=0)
-    y = np.array(model.predict(x, verbose=0))
+        flattened = (
+            scaler.transform(
+                flattened
+            )
+        )
 
-    if y.ndim == 2 and y.shape[1] == 2:
-        return float(y[0, LSTM_WILDFIRE_INDEX])
-    if y.ndim == 2 and y.shape[1] == 1:
-        return float(y[0, 0])
-    if y.ndim == 1:
-        return float(y[0])
-    raise ValueError(f"Unexpected LSTM model output shape: {y.shape}")
+        values = flattened.reshape(
+            SEQ_LEN,
+            N_FEATURES,
+        )
+
+    values = np.expand_dims(
+        values,
+        axis=0,
+    )
+
+    prediction = np.array(
+        model.predict(
+            values,
+            verbose=0,
+        )
+    )
+
+    if (
+        prediction.ndim == 2
+        and prediction.shape[1] == 2
+    ):
+        return float(
+            prediction[
+                0,
+                LSTM_WILDFIRE_INDEX,
+            ]
+        )
+
+    if (
+        prediction.ndim == 2
+        and prediction.shape[1] == 1
+    ):
+        return float(
+            prediction[0, 0]
+        )
+
+    if prediction.ndim == 1:
+        return float(
+            prediction[0]
+        )
+
+    raise ValueError(
+        "Unexpected LSTM model output shape: "
+        f"{prediction.shape}"
+    )
 
 
-def risk_info(p: float):
-    if p >= 0.75:
-        return "High", "🔥🔥🔥", "#cc2222"
-    if p >= 0.5:
-        return "Moderate", "🔥🔥", "#dd8800"
-    if p >= 0.25:
-        return "Low", "🔥", "#eecc00"
-    return "Minimal", "—", "#33aa33"
+def risk_info(
+    probability: float,
+):
+    if probability >= 0.75:
+        return (
+            "High",
+            "🔥🔥🔥",
+            "#cc2222",
+        )
+
+    if probability >= 0.5:
+        return (
+            "Moderate",
+            "🔥🔥",
+            "#dd8800",
+        )
+
+    if probability >= 0.25:
+        return (
+            "Low",
+            "🔥",
+            "#eecc00",
+        )
+
+    return (
+        "Minimal",
+        "—",
+        "#33aa33",
+    )
 
 
 # ============================================================
 # PAGE / SESSION STATE
 # ============================================================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.set_page_config(
+    page_title=APP_TITLE,
+    layout="wide",
+)
+
 st.title(APP_TITLE)
+
 st.caption(
-    "Click a location. The point snaps to the center of the selected H3 cell. "
-    "That same H3 cell center is used for both workflows."
+    "Click a location. The point snaps to the center of the selected "
+    "H3 cell. That same H3 cell center is used for both workflows."
 )
 
 st.markdown(
@@ -1367,19 +2250,24 @@ st.markdown(
     background: #2f2f2f;
     color: #f2f2f2;
 }
+
 [data-testid="stHeader"] {
     background: #2f2f2f;
 }
+
 [data-testid="stSidebar"] {
     background: #3a3a3a;
     border-right: 1px solid #555555;
 }
+
 [data-testid="stSidebar"] * {
     color: #f2f2f2 !important;
 }
+
 h1, h2, h3, h4, h5, h6, p, div, span, label {
     color: #f2f2f2;
 }
+
 .result-card {
     background: #444444;
     border: 1px solid #666666;
@@ -1387,19 +2275,24 @@ h1, h2, h3, h4, h5, h6, p, div, span, label {
     padding: 16px 18px;
     margin-bottom: 12px;
 }
+
 .stButton > button {
     background: #555555;
     color: #f2f2f2;
     border: 1px solid #777777;
     border-radius: 8px;
 }
+
 .stButton > button:hover {
     background: #666666;
     border-color: #888888;
 }
-[data-testid="stMetricValue"], [data-testid="stMetricLabel"] {
+
+[data-testid="stMetricValue"],
+[data-testid="stMetricLabel"] {
     color: #f2f2f2 !important;
 }
+
 code {
     color: #ffffff !important;
 }
@@ -1419,72 +2312,138 @@ state_defaults = {
     "era5_df": None,
     "cv_point_count": 0,
 }
-for key, value in state_defaults.items():
+
+for key, value in (
+    state_defaults.items()
+):
     if key not in st.session_state:
         st.session_state[key] = value
 
-sel_lat, sel_lon = st.session_state["selected_center"]
+selected_latitude, selected_longitude = (
+    st.session_state[
+        "selected_center"
+    ]
+)
 
 # Use a local date heuristic so the page never contacts CDS during startup.
-latest_end_dt = heuristic_latest_era5_date()
-latest_end = latest_end_dt.date()
+latest_end_datetime = (
+    heuristic_latest_era5_date()
+)
+
+latest_end_date = (
+    latest_end_datetime.date()
+)
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.header("Selected H3 cell")
+    st.header(
+        "Selected H3 cell"
+    )
 
-    if st.session_state["h3_cell"]:
-        st.write(f"H3 r{H3_RES} cell: `{st.session_state['h3_cell']}`")
+    if st.session_state[
+        "h3_cell"
+    ]:
         st.write(
-            f"Snapped centre: `{st.session_state['cell_lat']:.6f}, {st.session_state['cell_lon']:.6f}`"
+            f"H3 r{H3_RES} cell: "
+            f"`{st.session_state['h3_cell']}`"
         )
-        planned_points = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
-        st.write(f"CV extraction points: `{len(planned_points)}`")
+
+        st.write(
+            "Snapped centre: "
+            f"`{st.session_state['cell_lat']:.6f}, "
+            f"{st.session_state['cell_lon']:.6f}`"
+        )
+
+        planned_points = (
+            cv_points_for_h3_cell(
+                st.session_state[
+                    "h3_cell"
+                ],
+                SPACING_KM,
+            )
+        )
+
+        st.write(
+            "CV extraction points: "
+            f"`{len(planned_points)}`"
+        )
+
     else:
-        st.info("Click the map to select a cell.")
+        st.info(
+            "Click the map to select a cell."
+        )
 
     st.divider()
-    st.header("Meteorological settings")
+
+    st.header(
+        "Meteorological settings"
+    )
+
     end_date = st.date_input(
         "Sequence end date",
-        value=latest_end,
-        max_value=latest_end,
+        value=latest_end_date,
+        max_value=latest_end_date,
         help=(
-            "The app uses the last complete calendar month as the maximum. "
-            "ERA5-Land can occasionally be published later; choose an earlier "
-            "month if CDS reports that data is not available yet."
+            "The app uses the last complete calendar month as the "
+            "maximum. ERA5-Land can occasionally be published later; "
+            "choose an earlier month if CDS reports that data is not "
+            "available yet."
         ),
     )
-    st.caption(f"This fetches the last {SEQ_LEN} monthly time steps.")
+
+    st.caption(
+        f"This fetches the last "
+        f"{SEQ_LEN} monthly time steps."
+    )
 
     st.divider()
+
     run_cv = st.button(
         "Prediction Using Computervision",
         type="primary",
         use_container_width=True,
     )
-    run_lstm_btn = st.button(
+
+    run_lstm_button = st.button(
         "Prediction Using Meteorological Data",
         use_container_width=True,
     )
-    clear = st.button("Clear results", use_container_width=True)
+
+    clear = st.button(
+        "Clear results",
+        use_container_width=True,
+    )
 
 if clear:
-    for k in ["cv_df", "cv_imgs", "lstm_prob", "era5_df", "cv_point_count"]:
-        st.session_state[k] = state_defaults[k]
+    for key in [
+        "cv_df",
+        "cv_imgs",
+        "lstm_prob",
+        "era5_df",
+        "cv_point_count",
+    ]:
+        st.session_state[key] = (
+            state_defaults[key]
+        )
+
     rerun_app()
 
 
 # ============================================================
 # SINGLE MAP
 # ============================================================
-st.subheader("1) Pick a location")
+st.subheader(
+    "1) Pick a location"
+)
 
 main_map = folium.Map(
-    location=[sel_lat, sel_lon],
+    location=[
+        selected_latitude,
+        selected_longitude,
+    ],
     zoom_start=DEFAULT_ZOOM_PICK,
     tiles=ESRI_TILE_URL,
     attr=ESRI_ATTR,
@@ -1493,321 +2452,958 @@ main_map = folium.Map(
     height="540px",
 )
 
-# Only show a marker after the user has selected an H3 cell.
-if st.session_state["h3_cell"] is not None:
+# Do not render the default Leaflet marker before the first map click.
+# The default marker icon can display as an empty square on the initial
+# streamlit-folium iframe load.
+if (
+    st.session_state[
+        "h3_cell"
+    ]
+    is not None
+):
     Marker(
         location=[
-            st.session_state["cell_lat"],
-            st.session_state["cell_lon"],
+            st.session_state[
+                "cell_lat"
+            ],
+            st.session_state[
+                "cell_lon"
+            ],
         ],
         popup="Snapped H3 centre",
     ).add_to(main_map)
 
-if st.session_state["h3_cell"]:
-    poly_color = "#4a8a4a"
-    if st.session_state["lstm_prob"] is not None:
-        _, _, poly_color = risk_info(float(st.session_state["lstm_prob"]))
+if st.session_state[
+    "h3_cell"
+]:
+    polygon_color = "#4a8a4a"
+
+    if (
+        st.session_state[
+            "lstm_prob"
+        ]
+        is not None
+    ):
+        (
+            _,
+            _,
+            polygon_color,
+        ) = risk_info(
+            float(
+                st.session_state[
+                    "lstm_prob"
+                ]
+            )
+        )
 
     folium.Polygon(
-        locations=h3_polygon_coords(st.session_state["h3_cell"]),
-        color=poly_color,
+        locations=h3_polygon_coords(
+            st.session_state[
+                "h3_cell"
+            ]
+        ),
+        color=polygon_color,
         fill=True,
-        fill_color=poly_color,
+        fill_color=polygon_color,
         fill_opacity=0.28,
         weight=2,
         popup=(
-            f"H3: {st.session_state['h3_cell']}"
+            f"H3: "
+            f"{st.session_state['h3_cell']}"
             + (
-                f"<br>p_lstm={float(st.session_state['lstm_prob']):.3f}"
-                if st.session_state["lstm_prob"] is not None
+                "<br>p_lstm="
+                f"{float(st.session_state['lstm_prob']):.3f}"
+                if (
+                    st.session_state[
+                        "lstm_prob"
+                    ]
+                    is not None
+                )
                 else ""
             )
         ),
     ).add_to(main_map)
 
-# show planned CV extraction points before prediction,
-# and show colored prediction points after prediction
-if st.session_state["h3_cell"]:
-    planned_points = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
+# Show planned CV extraction points before prediction and coloured
+# prediction points after the CV workflow has run.
+if st.session_state[
+    "h3_cell"
+]:
+    planned_points = (
+        cv_points_for_h3_cell(
+            st.session_state[
+                "h3_cell"
+            ],
+            SPACING_KM,
+        )
+    )
 
-    if st.session_state["cv_df"] is None:
-        for name, la, lo in planned_points:
+    if (
+        st.session_state[
+            "cv_df"
+        ]
+        is None
+    ):
+        for (
+            name,
+            point_latitude,
+            point_longitude,
+        ) in planned_points:
             CircleMarker(
-                location=(la, lo),
-                radius=4 if name != "center" else 6,
+                location=(
+                    point_latitude,
+                    point_longitude,
+                ),
+                radius=(
+                    4
+                    if name != "center"
+                    else 6
+                ),
                 color="white",
                 fill=True,
                 fill_color="white",
                 fill_opacity=0.8,
                 popup=name,
             ).add_to(main_map)
-    else:
-        for _, row in st.session_state["cv_df"].iterrows():
-            la = float(row["lat"])
-            lo = float(row["lon"])
-            p = row.get("p_wildfire", None)
 
-            if p is None or (isinstance(p, float) and np.isnan(p)):
+    else:
+        for _, row in (
+            st.session_state[
+                "cv_df"
+            ].iterrows()
+        ):
+            point_latitude = float(
+                row["lat"]
+            )
+
+            point_longitude = float(
+                row["lon"]
+            )
+
+            probability = row.get(
+                "p_wildfire",
+                None,
+            )
+
+            if (
+                probability is None
+                or (
+                    isinstance(
+                        probability,
+                        float,
+                    )
+                    and np.isnan(
+                        probability
+                    )
+                )
+            ):
                 color = "gray"
-                popup = f"{row['point']}: error"
+                popup = (
+                    f"{row['point']}: error"
+                )
+
             else:
-                p = float(p)
-                color = "red" if p >= LIKELY_THRESHOLD else "blue"
-                popup = f"{row['point']}: p={p:.3f}"
+                probability = float(
+                    probability
+                )
+
+                color = (
+                    "red"
+                    if (
+                        probability
+                        >= LIKELY_THRESHOLD
+                    )
+                    else "blue"
+                )
+
+                popup = (
+                    f"{row['point']}: "
+                    f"p={probability:.3f}"
+                )
 
             CircleMarker(
-                location=(la, lo),
-                radius=5 if row["point"] != "center" else 7,
+                location=(
+                    point_latitude,
+                    point_longitude,
+                ),
+                radius=(
+                    5
+                    if (
+                        row["point"]
+                        != "center"
+                    )
+                    else 7
+                ),
                 color=color,
                 fill=True,
                 fill_opacity=0.85,
                 popup=popup,
             ).add_to(main_map)
 
-add_map_legend(main_map)
+add_map_legend(
+    main_map
+)
 
 picked = st_folium(
     main_map,
     height=540,
     key="main_map",
     use_container_width=True,
-    returned_objects=["last_clicked"],
+    returned_objects=[
+        "last_clicked"
+    ],
 )
 
-if picked and picked.get("last_clicked"):
-    click_lat = float(picked["last_clicked"]["lat"])
-    click_lon = float(picked["last_clicked"]["lng"])
-
-    new_cell = h3.latlng_to_cell(click_lat, click_lon, H3_RES)
-    cell_center = h3.cell_to_latlng(new_cell)
-    snapped_center = (round(float(cell_center[0]), 6), round(float(cell_center[1]), 6))
-
-    current_sig = (
-        st.session_state["selected_center"],
-        st.session_state["h3_cell"],
+if (
+    picked
+    and picked.get(
+        "last_clicked"
     )
-    new_sig = (snapped_center, new_cell)
+):
+    clicked_latitude = float(
+        picked[
+            "last_clicked"
+        ]["lat"]
+    )
 
-    if new_sig != current_sig:
-        st.session_state["selected_center"] = snapped_center
-        st.session_state["h3_cell"] = new_cell
-        st.session_state["cell_lat"] = snapped_center[0]
-        st.session_state["cell_lon"] = snapped_center[1]
-        st.session_state["cv_df"] = None
-        st.session_state["cv_imgs"] = []
-        st.session_state["lstm_prob"] = None
-        st.session_state["era5_df"] = None
-        st.session_state["cv_point_count"] = len(
-            cv_points_for_h3_cell(new_cell, SPACING_KM)
+    clicked_longitude = float(
+        picked[
+            "last_clicked"
+        ]["lng"]
+    )
+
+    new_cell = h3.latlng_to_cell(
+        clicked_latitude,
+        clicked_longitude,
+        H3_RES,
+    )
+
+    cell_center = (
+        h3.cell_to_latlng(
+            new_cell
         )
+    )
+
+    snapped_center = (
+        round(
+            float(
+                cell_center[0]
+            ),
+            6,
+        ),
+        round(
+            float(
+                cell_center[1]
+            ),
+            6,
+        ),
+    )
+
+    current_signature = (
+        st.session_state[
+            "selected_center"
+        ],
+        st.session_state[
+            "h3_cell"
+        ],
+    )
+
+    new_signature = (
+        snapped_center,
+        new_cell,
+    )
+
+    if (
+        new_signature
+        != current_signature
+    ):
+        st.session_state[
+            "selected_center"
+        ] = snapped_center
+
+        st.session_state[
+            "h3_cell"
+        ] = new_cell
+
+        st.session_state[
+            "cell_lat"
+        ] = snapped_center[0]
+
+        st.session_state[
+            "cell_lon"
+        ] = snapped_center[1]
+
+        st.session_state[
+            "cv_df"
+        ] = None
+
+        st.session_state[
+            "cv_imgs"
+        ] = []
+
+        st.session_state[
+            "lstm_prob"
+        ] = None
+
+        st.session_state[
+            "era5_df"
+        ] = None
+
+        st.session_state[
+            "cv_point_count"
+        ] = len(
+            cv_points_for_h3_cell(
+                new_cell,
+                SPACING_KM,
+            )
+        )
+
         rerun_app()
 
-if st.session_state["h3_cell"] is None:
-    st.info("Click on the map to choose a location before running a prediction.")
+if (
+    st.session_state[
+        "h3_cell"
+    ]
+    is None
+):
+    st.info(
+        "Click on the map to choose a location "
+        "before running a prediction."
+    )
 
 
 # ============================================================
 # RUN MODELS
 # ============================================================
 want_cv = run_cv
-want_lstm = run_lstm_btn
+want_lstm = run_lstm_button
 
 if want_cv:
     try:
-        if st.session_state["h3_cell"] is None:
-            st.error("Please click on the map first to select an H3 cell.")
-        else:
-            token = get_mapbox_token()
-            with st.spinner("Loading computer-vision model…"):
-                cv_model = load_cv_model_cached()
+        if (
+            st.session_state[
+                "h3_cell"
+            ]
+            is None
+        ):
+            st.error(
+                "Please click on the map first "
+                "to select an H3 cell."
+            )
 
-            pts = cv_points_for_h3_cell(st.session_state["h3_cell"], SPACING_KM)
+        else:
+            mapbox_token = (
+                get_mapbox_token()
+            )
+
+            with st.spinner(
+                "Loading computer-vision model…"
+            ):
+                cv_model = (
+                    load_cv_model_cached()
+                )
+
+            points = (
+                cv_points_for_h3_cell(
+                    st.session_state[
+                        "h3_cell"
+                    ],
+                    SPACING_KM,
+                )
+            )
 
             rows = []
-            imgs = []
-            with st.spinner("Downloading satellite images and running CV predictions…"):
-                for name, la, lo in pts:
+            images = []
+
+            with st.spinner(
+                "Downloading satellite images and "
+                "running CV predictions…"
+            ):
+                for (
+                    name,
+                    point_latitude,
+                    point_longitude,
+                ) in points:
                     try:
-                        img = fetch_tile(lo, la, token)
-                        p = predict_wildfire_prob_cv(cv_model, img)
-                        rows.append(
-                            {"point": name, "lat": la, "lon": lo, "p_wildfire": p}
+                        image = fetch_tile(
+                            point_longitude,
+                            point_latitude,
+                            mapbox_token,
                         )
-                        imgs.append((name, la, lo, p, img))
-                    except Exception as e:
+
+                        probability = (
+                            predict_wildfire_prob_cv(
+                                cv_model,
+                                image,
+                            )
+                        )
+
                         rows.append(
                             {
                                 "point": name,
-                                "lat": la,
-                                "lon": lo,
-                                "p_wildfire": None,
-                                "error": str(e),
+                                "lat": (
+                                    point_latitude
+                                ),
+                                "lon": (
+                                    point_longitude
+                                ),
+                                "p_wildfire": (
+                                    probability
+                                ),
                             }
                         )
 
-            st.session_state["cv_df"] = pd.DataFrame(rows)
-            st.session_state["cv_imgs"] = imgs
-            st.session_state["cv_point_count"] = len(pts)
+                        images.append(
+                            (
+                                name,
+                                point_latitude,
+                                point_longitude,
+                                probability,
+                                image,
+                            )
+                        )
+
+                    except Exception as exception:
+                        rows.append(
+                            {
+                                "point": name,
+                                "lat": (
+                                    point_latitude
+                                ),
+                                "lon": (
+                                    point_longitude
+                                ),
+                                "p_wildfire": None,
+                                "error": str(
+                                    exception
+                                ),
+                            }
+                        )
+
+            st.session_state[
+                "cv_df"
+            ] = pd.DataFrame(
+                rows
+            )
+
+            st.session_state[
+                "cv_imgs"
+            ] = images
+
+            st.session_state[
+                "cv_point_count"
+            ] = len(points)
+
             rerun_app()
 
-    except Exception as e:
-        st.error(f"Computer-vision pipeline failed: {e}")
+    except Exception as exception:
+        st.error(
+            "Computer-vision pipeline failed: "
+            f"{exception}"
+        )
 
 if want_lstm:
     try:
-        if st.session_state["h3_cell"] is None:
-            st.error("Please click on the map first to select an H3 cell.")
+        if (
+            st.session_state[
+                "h3_cell"
+            ]
+            is None
+        ):
+            st.error(
+                "Please click on the map first "
+                "to select an H3 cell."
+            )
+
         else:
-            with st.spinner("Loading meteorological model…"):
-                lstm_model = load_lstm_model_cached()
-                scaler = load_scaler_cached()
+            with st.spinner(
+                "Loading meteorological model…"
+            ):
+                lstm_model = (
+                    load_lstm_model_cached()
+                )
 
-            cell_lat = st.session_state["cell_lat"]
-            cell_lon = st.session_state["cell_lon"]
-            end_str = end_date.strftime("%Y-%m-%d")
+                scaler = (
+                    load_scaler_cached()
+                )
 
-            with st.spinner("Fetching ERA5-Land monthly means…"):
-                era5_df = fetch_era5_sequence(cell_lat, cell_lon, end_str)
-                st.session_state["era5_df"] = era5_df
+            cell_latitude = (
+                st.session_state[
+                    "cell_lat"
+                ]
+            )
 
-            with st.spinner("Running LSTM inference…"):
-                st.session_state["lstm_prob"] = run_lstm(lstm_model, scaler, era5_df)
+            cell_longitude = (
+                st.session_state[
+                    "cell_lon"
+                ]
+            )
+
+            end_date_string = (
+                end_date.strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+            with st.spinner(
+                "Fetching ERA5-Land monthly means…"
+            ):
+                era5_dataframe = (
+                    fetch_era5_sequence(
+                        cell_latitude,
+                        cell_longitude,
+                        end_date_string,
+                    )
+                )
+
+                st.session_state[
+                    "era5_df"
+                ] = era5_dataframe
+
+            with st.spinner(
+                "Running LSTM inference…"
+            ):
+                st.session_state[
+                    "lstm_prob"
+                ] = run_lstm(
+                    lstm_model,
+                    scaler,
+                    era5_dataframe,
+                )
 
             rerun_app()
 
-    except Exception as e:
-        st.error(f"Meteorological pipeline failed: {e}")
+    except Exception as exception:
+        st.error(
+            "Meteorological pipeline failed: "
+            f"{exception}"
+        )
 
 
 # ============================================================
 # RESULTS
 # ============================================================
-st.subheader("2) Results")
+st.subheader(
+    "2) Results"
+)
 
-if st.session_state["cv_df"] is None and st.session_state["lstm_prob"] is None:
-    st.info("No prediction has been run yet.")
+if (
+    st.session_state[
+        "cv_df"
+    ]
+    is None
+    and st.session_state[
+        "lstm_prob"
+    ]
+    is None
+):
+    st.info(
+        "No prediction has been run yet."
+    )
+
 else:
-    col1, col2 = st.columns(2)
+    column_one, column_two = (
+        st.columns(2)
+    )
 
-    with col1:
-        if st.session_state["cv_df"] is not None:
-            cv_df = st.session_state["cv_df"].copy()
-            likely_count, stars, emoji, msg = compute_fire_rating(cv_df)
-            center_row = cv_df.loc[cv_df["point"] == "center", "p_wildfire"]
-            center_p = center_row.iloc[0] if not center_row.empty else np.nan
+    with column_one:
+        if (
+            st.session_state[
+                "cv_df"
+            ]
+            is not None
+        ):
+            cv_dataframe = (
+                st.session_state[
+                    "cv_df"
+                ].copy()
+            )
+
+            (
+                likely_count,
+                stars,
+                emoji,
+                message,
+            ) = compute_fire_rating(
+                cv_dataframe
+            )
+
+            center_rows = cv_dataframe.loc[
+                cv_dataframe[
+                    "point"
+                ]
+                == "center",
+                "p_wildfire",
+            ]
+
+            center_probability = (
+                center_rows.iloc[0]
+                if not center_rows.empty
+                else np.nan
+            )
 
             center_line = (
-                f"<div>Center tile probability: <b>{float(center_p):.3f}</b></div>"
-                if pd.notna(center_p)
-                else "<div>Center tile probability: <b>—</b></div>"
+                "<div>Center tile "
+                "probability: "
+                f"<b>{float(center_probability):.3f}"
+                "</b></div>"
+                if pd.notna(
+                    center_probability
+                )
+                else (
+                    "<div>Center tile "
+                    "probability: "
+                    "<b>—</b></div>"
+                )
             )
 
             body = f"""
-<div style="font-size:2.0rem; font-weight:900; margin: 0 0 10px 0;">{html.escape(emoji)}</div>
-<div>Likely fire tiles: <b>{likely_count} / {len(cv_df)}</b> (threshold ≥ {LIKELY_THRESHOLD:.2f})</div>
-<div>Downloaded images: <b>{len(cv_df)}</b></div>
+<div style="font-size:2rem; font-weight:900; margin:0 0 10px 0;">
+    {html.escape(emoji)}
+</div>
+<div>
+    Likely fire tiles:
+    <b>{likely_count} / {len(cv_dataframe)}</b>
+    (threshold ≥ {LIKELY_THRESHOLD:.2f})
+</div>
+<div>
+    Downloaded images:
+    <b>{len(cv_dataframe)}</b>
+</div>
 {center_line}
-<div style="margin-top:8px;">{html.escape(msg)}</div>
+<div style="margin-top:8px;">
+    {html.escape(message)}
+</div>
 """
-            render_result_card("Computer vision result", body)
-        else:
-            render_result_card("Computer vision result", "<div>Not run yet.</div>")
 
-    with col2:
-        if st.session_state["lstm_prob"] is not None:
-            p_lstm = float(st.session_state["lstm_prob"])
-            label, emoji, color = risk_info(p_lstm)
-            above = "Above threshold" if p_lstm >= LSTM_THRESHOLD else "Below threshold"
+            render_result_card(
+                "Computer vision result",
+                body,
+            )
+
+        else:
+            render_result_card(
+                "Computer vision result",
+                "<div>Not run yet.</div>",
+            )
+
+    with column_two:
+        if (
+            st.session_state[
+                "lstm_prob"
+            ]
+            is not None
+        ):
+            lstm_probability = float(
+                st.session_state[
+                    "lstm_prob"
+                ]
+            )
+
+            (
+                label,
+                emoji,
+                color,
+            ) = risk_info(
+                lstm_probability
+            )
+
+            threshold_status = (
+                "Above threshold"
+                if (
+                    lstm_probability
+                    >= LSTM_THRESHOLD
+                )
+                else "Below threshold"
+            )
 
             body = f"""
-<div style="font-size:1.8rem; font-weight:900; color:{html.escape(color)}; margin: 0 0 8px 0;">
-  {html.escape(emoji)} {html.escape(label)}
+<div style="font-size:1.8rem; font-weight:900; color:{html.escape(color)}; margin:0 0 8px 0;">
+    {html.escape(emoji)} {html.escape(label)}
 </div>
-<div>Fire probability: <b>{p_lstm:.3f}</b></div>
-<div>{html.escape(above)} (threshold = {LSTM_THRESHOLD:.2f})</div>
-<div style="margin-top:8px;">H3 cell: <code>{html.escape(str(st.session_state['h3_cell']))}</code></div>
+<div>
+    Fire probability:
+    <b>{lstm_probability:.3f}</b>
+</div>
+<div>
+    {html.escape(threshold_status)}
+    (threshold = {LSTM_THRESHOLD:.2f})
+</div>
+<div style="margin-top:8px;">
+    H3 cell:
+    <code>{html.escape(str(st.session_state["h3_cell"]))}</code>
+</div>
 """
-            render_result_card("Meteorological result", body)
+
+            render_result_card(
+                "Meteorological result",
+                body,
+            )
+
         else:
-            render_result_card("Meteorological result", "<div>Not run yet.</div>")
+            render_result_card(
+                "Meteorological result",
+                "<div>Not run yet.</div>",
+            )
 
-    tab_cv, tab_lstm = st.tabs(["Computer vision details", "Meteorological details"])
+    (
+        computer_vision_tab,
+        meteorological_tab,
+    ) = st.tabs(
+        [
+            "Computer vision details",
+            "Meteorological details",
+        ]
+    )
 
-    with tab_cv:
-        if st.session_state["cv_df"] is None:
-            st.info("Run the computer-vision model to see details here.")
+    with computer_vision_tab:
+        if (
+            st.session_state[
+                "cv_df"
+            ]
+            is None
+        ):
+            st.info(
+                "Run the computer-vision model "
+                "to see details here."
+            )
+
         else:
-            df = st.session_state["cv_df"].copy()
-            imgs = st.session_state.get("cv_imgs", [])
+            dataframe = (
+                st.session_state[
+                    "cv_df"
+                ].copy()
+            )
 
-            st.write(f"Extraction points used: **{len(df)}**")
-            st.dataframe(df, use_container_width=True)
+            images = (
+                st.session_state.get(
+                    "cv_imgs",
+                    [],
+                )
+            )
+
+            st.write(
+                "Extraction points used: "
+                f"**{len(dataframe)}**"
+            )
+
+            st.dataframe(
+                dataframe,
+                use_container_width=True,
+            )
 
             st.download_button(
                 "Download CV CSV",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="wildfire_predictions_cv_h3cell.csv",
+                data=(
+                    dataframe.to_csv(
+                        index=False
+                    ).encode("utf-8")
+                ),
+                file_name=(
+                    "wildfire_predictions_"
+                    "cv_h3cell.csv"
+                ),
                 mime="text/csv",
             )
 
-            st.markdown("**Satellite images**")
-            if imgs:
-                n_cols = 4
-                for start in range(0, len(imgs), n_cols):
-                    cols = st.columns(n_cols)
-                    for col, item in zip(cols, imgs[start : start + n_cols]):
-                        name, la, lo, p, img = item
-                        with col:
-                            caption = f"{name}\n{lo:.6f}, {la:.6f}\n"
-                            caption += f"p={p:.3f}" if p is not None else "p=None"
-                            st.image(img, caption=caption, use_container_width=True)
+            st.markdown(
+                "**Satellite images**"
+            )
+
+            if images:
+                column_count = 4
+
+                for start in range(
+                    0,
+                    len(images),
+                    column_count,
+                ):
+                    columns = st.columns(
+                        column_count
+                    )
+
+                    for column, item in zip(
+                        columns,
+                        images[
+                            start:
+                            start
+                            + column_count
+                        ],
+                    ):
+                        (
+                            name,
+                            point_latitude,
+                            point_longitude,
+                            probability,
+                            image,
+                        ) = item
+
+                        with column:
+                            caption = (
+                                f"{name}\n"
+                                f"{point_longitude:.6f}, "
+                                f"{point_latitude:.6f}\n"
+                            )
+
+                            caption += (
+                                f"p={probability:.3f}"
+                                if (
+                                    probability
+                                    is not None
+                                )
+                                else "p=None"
+                            )
+
+                            st.image(
+                                image,
+                                caption=caption,
+                                use_container_width=True,
+                            )
+
             else:
                 st.warning(
-                    "No images were produced. Check the errors in the table above."
+                    "No images were produced. "
+                    "Check the errors in the "
+                    "table above."
                 )
 
-    with tab_lstm:
-        if st.session_state["lstm_prob"] is None:
-            st.info("Run the meteorological model to see details here.")
+    with meteorological_tab:
+        if (
+            st.session_state[
+                "lstm_prob"
+            ]
+            is None
+        ):
+            st.info(
+                "Run the meteorological model "
+                "to see details here."
+            )
+
         else:
-            p_val = float(st.session_state["lstm_prob"])
-            label, emoji, color = risk_info(p_val)
+            probability = float(
+                st.session_state[
+                    "lstm_prob"
+                ]
+            )
+
+            (
+                label,
+                emoji,
+                color,
+            ) = risk_info(
+                probability
+            )
+
             st.markdown(
-                f"<div class='result-card'><span style='font-size:2rem;color:{color};font-weight:800;'>"
-                f"{emoji} {label} Risk</span><br><br>"
-                f"H3 cell: <code>{st.session_state['h3_cell']}</code><br>"
-                f"H3 centre: {st.session_state['cell_lat']:.6f}, {st.session_state['cell_lon']:.6f}</div>",
+                (
+                    "<div class='result-card'>"
+                    f"<span style='font-size:2rem;"
+                    f"color:{color};font-weight:800;'>"
+                    f"{emoji} {label} Risk"
+                    "</span><br><br>"
+                    "H3 cell: "
+                    f"<code>{st.session_state['h3_cell']}</code>"
+                    "<br>"
+                    "H3 centre: "
+                    f"{st.session_state['cell_lat']:.6f}, "
+                    f"{st.session_state['cell_lon']:.6f}"
+                    "</div>"
+                ),
                 unsafe_allow_html=True,
             )
 
-            if st.session_state["era5_df"] is not None:
-                df_show = st.session_state["era5_df"].copy()
-                st.dataframe(df_show, use_container_width=True)
+            if (
+                st.session_state[
+                    "era5_df"
+                ]
+                is not None
+            ):
+                dataframe = (
+                    st.session_state[
+                        "era5_df"
+                    ].copy()
+                )
+
+                st.dataframe(
+                    dataframe,
+                    use_container_width=True,
+                )
+
                 st.download_button(
                     "Download ERA5 CSV",
-                    data=df_show.to_csv(index=False).encode("utf-8"),
-                    file_name=f"era5_{st.session_state['h3_cell']}_{end_date}.csv",
+                    data=(
+                        dataframe.to_csv(
+                            index=False
+                        ).encode("utf-8")
+                    ),
+                    file_name=(
+                        f"era5_"
+                        f"{st.session_state['h3_cell']}_"
+                        f"{end_date}.csv"
+                    ),
                     mime="text/csv",
                 )
 
-                st.markdown("**Feature trends**")
-                cols = st.columns(3)
+                st.markdown(
+                    "**Feature trends**"
+                )
+
+                columns = st.columns(3)
+
                 chart_features = [
-                    ("2m_temperature", "Temperature (K)"),
-                    ("total_precipitation", "Precipitation (m)"),
-                    ("wind_total", "Wind speed (m/s)"),
-                    ("volumetric_soil_water_layer_1", "Soil water (m³/m³)"),
-                    ("surface_solar_radiation_downwards", "Solar radiation (J/m²)"),
-                    ("leaf_area_index_high_vegetation", "LAI high vegetation"),
+                    (
+                        "2m_temperature",
+                        "Temperature (K)",
+                    ),
+                    (
+                        "total_precipitation",
+                        "Precipitation (m)",
+                    ),
+                    (
+                        "wind_total",
+                        "Wind speed (m/s)",
+                    ),
+                    (
+                        "volumetric_soil_water_layer_1",
+                        "Soil water (m³/m³)",
+                    ),
+                    (
+                        "surface_solar_radiation_downwards",
+                        "Solar radiation (J/m²)",
+                    ),
+                    (
+                        "leaf_area_index_high_vegetation",
+                        "LAI high vegetation",
+                    ),
                 ]
-                for i, (feat, title) in enumerate(chart_features):
-                    with cols[i % 3]:
-                        st.caption(title)
-                        if feat in df_show.columns:
+
+                for index, (
+                    feature,
+                    title,
+                ) in enumerate(
+                    chart_features
+                ):
+                    with columns[
+                        index % 3
+                    ]:
+                        st.caption(
+                            title
+                        )
+
+                        if (
+                            feature
+                            in dataframe.columns
+                        ):
                             st.line_chart(
-                                df_show.set_index("date")[feat],
+                                dataframe.set_index(
+                                    "date"
+                                )[feature],
                                 height=140,
                                 use_container_width=True,
                             )
 
-st.caption("Streamlit app combining Mapbox + VGG16 and ERA5-Land + LSTM")
+
+st.caption(
+    "Streamlit app combining Mapbox + VGG16 "
+    "and ERA5-Land + LSTM"
+)
