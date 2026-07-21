@@ -1493,7 +1493,15 @@ main_map = folium.Map(
     height="540px",
 )
 
-Marker(location=[sel_lat, sel_lon], popup="Snapped H3 centre").add_to(main_map)
+# Only show a marker after the user has selected an H3 cell.
+if st.session_state["h3_cell"] is not None:
+    Marker(
+        location=[
+            st.session_state["cell_lat"],
+            st.session_state["cell_lon"],
+        ],
+        popup="Snapped H3 centre",
+    ).add_to(main_map)
 
 if st.session_state["h3_cell"]:
     poly_color = "#4a8a4a"
